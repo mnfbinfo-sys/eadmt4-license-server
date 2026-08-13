@@ -65,7 +65,7 @@ class CheckRequest(BaseModel):
 
 
 # ----------------------------------------------------------------------
-# API usada pelo aplicativo (cliente)
+# API usada pelo aplicativo (cliente) com logs em tempo real
 # ----------------------------------------------------------------------
 @app.post("/api/check")
 def check_license(payload: CheckRequest):
@@ -92,6 +92,7 @@ def check_license(payload: CheckRequest):
         conn.commit()
         status = "trial"
         expires_at = trial_expires
+        print(f"[LOG] Nova maquina registrada (TRIAL): {payload.machine_id} | Nome: {payload.machine_name}")
     else:
         conn.execute(
             "UPDATE licenses SET last_seen = ?, machine_name = ? WHERE machine_id = ?",
@@ -102,6 +103,7 @@ def check_license(payload: CheckRequest):
         if row["revoked"]:
             status = "revoked"
             expires_at = None
+            print(f"[LOG] Acesso NEGADO (Revogado): {payload.machine_id}")
         else:
             license_expires = parse_dt(row["license_expires"]) if row["license_expires"] else None
             trial_expires = parse_dt(row["trial_expires"])
@@ -109,12 +111,15 @@ def check_license(payload: CheckRequest):
             if license_expires and license_expires > now:
                 status = "licensed"
                 expires_at = license_expires
+                print(f"[LOG] Acesso PERMITIDO (Licenciado): {payload.machine_id}")
             elif trial_expires > now:
                 status = "trial"
                 expires_at = trial_expires
+                print(f"[LOG] Acesso PERMITIDO (Trial): {payload.machine_id}")
             else:
                 status = "expired"
                 expires_at = None
+                print(f"[LOG] Acesso NEGADO (Expirado): {payload.machine_id}")
 
     conn.close()
     return {
