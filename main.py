@@ -65,7 +65,7 @@ class CheckRequest(BaseModel):
 
 
 # ----------------------------------------------------------------------
-# API usada pelo aplicativo (cliente) com logs em tempo real
+# API usada pelo aplicativo (cliente)
 # ----------------------------------------------------------------------
 @app.post("/api/check")
 def check_license(payload: CheckRequest):
@@ -92,7 +92,6 @@ def check_license(payload: CheckRequest):
         conn.commit()
         status = "trial"
         expires_at = trial_expires
-        print(f"[LOG] Nova maquina registrada (TRIAL): {payload.machine_id} | Nome: {payload.machine_name}")
     else:
         conn.execute(
             "UPDATE licenses SET last_seen = ?, machine_name = ? WHERE machine_id = ?",
@@ -103,7 +102,6 @@ def check_license(payload: CheckRequest):
         if row["revoked"]:
             status = "revoked"
             expires_at = None
-            print(f"[LOG] Acesso NEGADO (Revogado): {payload.machine_id}")
         else:
             license_expires = parse_dt(row["license_expires"]) if row["license_expires"] else None
             trial_expires = parse_dt(row["trial_expires"])
@@ -111,15 +109,12 @@ def check_license(payload: CheckRequest):
             if license_expires and license_expires > now:
                 status = "licensed"
                 expires_at = license_expires
-                print(f"[LOG] Acesso PERMITIDO (Licenciado): {payload.machine_id}")
             elif trial_expires > now:
                 status = "trial"
                 expires_at = trial_expires
-                print(f"[LOG] Acesso PERMITIDO (Trial): {payload.machine_id}")
             else:
                 status = "expired"
                 expires_at = None
-                print(f"[LOG] Acesso NEGADO (Expirado): {payload.machine_id}")
 
     conn.close()
     return {
@@ -152,7 +147,11 @@ PAGE_STYLE = """
   .btn-extend:hover { background:#16a34a; }
   .btn-revoke { background:#ef4444; color:#fff; }
   .btn-revoke:hover { background:#dc2626; }
-  .mono { font-family: monospace; font-size:11px; color:#94a3b8; }
+  .mono { font-family: monospace; font-size:11px; color:#94a3b8; cursor:pointer;
+          max-width: 140px; overflow:hidden; text-overflow: ellipsis; white-space: nowrap;
+          display:inline-block; vertical-align:middle; }
+  .mono:hover { color:#e5e7eb; text-decoration: underline dotted; }
+  .copied-msg { color:#22c55e; font-size:10px; margin-left:6px; display:none; }
   a.logout { color:#94a3b8; font-size:12px; }
   .login-box { background:#1f2937; padding:32px; border-radius:10px; width:300px;
                box-shadow:0 4px 20px rgba(0,0,0,.4); margin: 10vh auto; }
@@ -189,7 +188,7 @@ def render_dashboard_page(items):
         rows_html += """
         <tr>
           <td>""" + escape(item['machine_name']) + """</td>
-          <td class="mono">""" + escape(item['machine_id'][:12]) + """&#8230;</td>
+          <td><span class="mono" title=\"""" + escape(item['machine_id']) + """\" onclick="navigator.clipboard.writeText(this.textContent);var m=this.nextElementSibling;m.style.display='inline';setTimeout(function(){m.style.display='none';},1200);">""" + escape(item['machine_id']) + """</span><span class="copied-msg">Copiado!</span></td>
           <td><span class="badge """ + badge_class + """">""" + escape(item['status']) + """</span></td>
           <td>""" + item['trial_expires'] + """</td>
           <td>""" + item['license_expires'] + """</td>
