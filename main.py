@@ -10,9 +10,6 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from itsdangerous import URLSafeSerializer, BadSignature
 from pydantic import BaseModel
 
-# ----------------------------------------------------------------------
-# Configuração (via variáveis de ambiente no Render)
-# ----------------------------------------------------------------------
 TURSO_DATABASE_URL = os.environ.get("TURSO_DATABASE_URL")
 TURSO_AUTH_TOKEN = os.environ.get("TURSO_AUTH_TOKEN")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "troque-esta-senha")
@@ -65,9 +62,6 @@ class CheckRequest(BaseModel):
     license_key: str = ""
 
 
-# ----------------------------------------------------------------------
-# API usada pelo aplicativo (cliente)
-# ----------------------------------------------------------------------
 @app.post("/api/check")
 def check_license(payload: CheckRequest):
     conn = get_db()
@@ -194,45 +188,190 @@ def check_license(payload: CheckRequest):
 
 
 # ----------------------------------------------------------------------
-# Painel administrativo
+# NOVO VISUAL — CORES DA DERIV
+# Vermelho #ff444f, fundo claro #f5f7f9, cards brancos, tipografia moderna
 # ----------------------------------------------------------------------
 PAGE_STYLE = """
 <style>
-  body { font-family: Arial, sans-serif; background:#0f172a; color:#e5e7eb; margin:0; padding:24px; }
-  h1 { font-size:20px; margin-bottom:4px; }
-  .sub { color:#94a3b8; margin-bottom:20px; font-size:13px; }
-  table { width:100%; border-collapse: collapse; background:#1e293b; border-radius:8px; overflow:hidden; }
-  th, td { padding:10px 12px; text-align:left; font-size:13px; border-bottom:1px solid #334155; }
-  th { background:#111827; color:#94a3b8; font-weight:600; }
-  tr:hover { background:#243043; }
-  .badge { padding:3px 8px; border-radius:12px; font-size:11px; font-weight:bold; white-space:nowrap; }
-  .badge.trial { background:#3b82f6; color:#fff; }
-  .badge.licenciado { background:#22c55e; color:#052e14; }
-  .badge.expirado { background:#ef4444; color:#fff; }
-  .badge.revogado { background:#6b7280; color:#fff; }
-  .badge.ativo { background:#22c55e; color:#052e14; }
-  .badge.pendente { background:#eab308; color:#422006; }
-  form { display:inline; }
-  button { padding:6px 10px; border:none; border-radius:6px; cursor:pointer; font-size:12px; margin-right:4px; }
-  .btn-extend { background:#22c55e; color:#052e14; font-weight:bold; }
-  .btn-extend:hover { background:#16a34a; }
-  .btn-revoke { background:#ef4444; color:#fff; }
-  .btn-revoke:hover { background:#dc2626; }
-  .btn-reset { background:#64748b; color:#fff; }
-  .btn-reset:hover { background:#475569; }
-  .btn-new { background:#22c55e; color:#052e14; font-weight:bold; padding:10px 16px; }
-  .mono { font-family: monospace; font-size:11px; color:#94a3b8; cursor:pointer;
-          max-width: 140px; overflow:hidden; text-overflow: ellipsis; white-space: nowrap;
-          display:inline-block; vertical-align:middle; }
-  .mono:hover { color:#e5e7eb; text-decoration: underline dotted; }
-  .copied-msg { color:#22c55e; font-size:10px; margin-left:6px; display:none; }
-  a.logout { color:#94a3b8; font-size:12px; }
-  .login-box { background:#1f2937; padding:32px; border-radius:10px; width:300px;
-               box-shadow:0 4px 20px rgba(0,0,0,.4); margin: 10vh auto; }
-  input { width:100%; padding:10px; margin-bottom:14px; border-radius:6px; border:1px solid #374151;
-          background:#111827; color:#e5e7eb; box-sizing:border-box; }
-  .login-box button { width:100%; padding:10px; background:#22c55e; color:#fff; font-weight:bold; }
-  .error { color:#f87171; margin-bottom:12px; font-size:14px; }
+  :root {
+    --deriv-red: #ff444f;
+    --deriv-red-dark: #eb3e48;
+    --deriv-black: #0e0e0e;
+    --deriv-gray: #6b6b6b;
+    --deriv-light: #f5f7f9;
+    --deriv-border: #e6e9e9;
+    --deriv-green: #4caf50;
+    --deriv-blue: #2196f3;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: 'IBM Plex Sans', 'Segoe UI', Arial, sans-serif;
+    background: var(--deriv-light);
+    color: var(--deriv-black);
+    margin: 0;
+    padding: 0;
+  }
+  .wrapper {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 32px 24px;
+  }
+  h1 {
+    font-size: 32px;
+    font-weight: 800;
+    margin: 0 0 4px 0;
+    color: var(--deriv-black);
+    letter-spacing: -0.5px;
+  }
+  .sub {
+    color: var(--deriv-gray);
+    font-size: 14px;
+    margin-bottom: 24px;
+    padding-top: 8px;
+    border-top: 1px solid var(--deriv-border);
+  }
+  .sub a {
+    color: var(--deriv-red);
+    text-decoration: none;
+    font-weight: 500;
+  }
+  .sub a:hover { text-decoration: underline; }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    background: #fff;
+    border-radius: 8px;
+    overflow: hidden;
+    box-shadow: 0 1px 3px rgba(0,0,0,.04);
+    font-size: 14px;
+  }
+  th, td {
+    padding: 12px 16px;
+    text-align: left;
+    border-bottom: 1px solid var(--deriv-border);
+  }
+  th {
+    background: var(--deriv-light);
+    color: var(--deriv-gray);
+    font-weight: 600;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: #fafbfc; }
+  .badge {
+    padding: 4px 10px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+    white-space: nowrap;
+    display: inline-block;
+  }
+  .badge.trial      { background: #e3f2fd; color: var(--deriv-blue); }
+  .badge.licenciado { background: #e8f5e9; color: var(--deriv-green); }
+  .badge.expirado   { background: #fff3e0; color: #e65100; }
+  .badge.revogado   { background: #eeeeee; color: #616161; }
+  .badge.ativo      { background: #e8f5e9; color: var(--deriv-green); }
+  .badge.pendente   { background: #fff8e1; color: #f57c00; }
+  form { display: inline; }
+  button {
+    padding: 7px 14px;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 12px;
+    font-weight: 600;
+    margin-right: 4px;
+    transition: all 0.15s ease;
+  }
+  .btn-extend { background: var(--deriv-green); color: #fff; }
+  .btn-extend:hover { background: #3d9140; }
+  .btn-revoke { background: var(--deriv-red); color: #fff; }
+  .btn-revoke:hover { background: var(--deriv-red-dark); }
+  .btn-reset { background: #6b6b6b; color: #fff; }
+  .btn-reset:hover { background: #555; }
+  .btn-new {
+    background: var(--deriv-red);
+    color: #fff;
+    font-weight: 700;
+    padding: 12px 24px;
+    font-size: 14px;
+  }
+  .btn-new:hover { background: var(--deriv-red-dark); }
+  .mono {
+    font-family: 'IBM Plex Mono', Consolas, monospace;
+    font-size: 12px;
+    color: var(--deriv-gray);
+    cursor: pointer;
+    max-width: 180px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    display: inline-block;
+    vertical-align: middle;
+    padding: 2px 6px;
+    background: var(--deriv-light);
+    border-radius: 3px;
+  }
+  .mono:hover { color: var(--deriv-red); }
+  .copied-msg {
+    color: var(--deriv-green);
+    font-size: 11px;
+    font-weight: 700;
+    margin-left: 6px;
+    display: none;
+  }
+  .login-box {
+    background: #fff;
+    padding: 40px;
+    border-radius: 8px;
+    width: 400px;
+    max-width: 90%;
+    box-shadow: 0 4px 12px rgba(0,0,0,.06);
+    margin: 12vh auto;
+    border-top: 4px solid var(--deriv-red);
+  }
+  .login-box h1 {
+    font-size: 28px;
+    margin-bottom: 24px;
+    color: var(--deriv-black);
+  }
+  input {
+    width: 100%;
+    padding: 12px 14px;
+    margin-bottom: 16px;
+    border-radius: 4px;
+    border: 1px solid var(--deriv-border);
+    background: #fff;
+    color: var(--deriv-black);
+    font-size: 14px;
+    transition: border-color 0.15s;
+  }
+  input:focus {
+    outline: none;
+    border-color: var(--deriv-red);
+  }
+  .login-box button {
+    width: 100%;
+    padding: 14px;
+    background: var(--deriv-red);
+    color: #fff;
+    font-weight: 700;
+    font-size: 14px;
+  }
+  .login-box button:hover { background: var(--deriv-red-dark); }
+  .error {
+    color: var(--deriv-red);
+    background: #fdecea;
+    padding: 10px 14px;
+    border-radius: 4px;
+    margin-bottom: 16px;
+    font-size: 13px;
+    font-weight: 500;
+  }
 </style>
 """
 
@@ -240,10 +379,10 @@ PAGE_STYLE = """
 def render_login_page(error=None):
     error_html = '<div class="error">' + escape(error) + '</div>' if error else ""
     return """<!DOCTYPE html>
-<html lang="pt-br"><head><meta charset="UTF-8"><title>Login - Painel de Licencas</title>""" + PAGE_STYLE + """</head>
+<html lang="pt-br"><head><meta charset="UTF-8"><title>Login - EADMT4-PRO</title>""" + PAGE_STYLE + """</head>
 <body>
   <div class="login-box">
-    <h1>Painel de Licencas<br>EADMT4-PRO</h1>
+    <h1>EADMT4-PRO</h1>
     """ + error_html + """
     <form method="post" action="/admin/login">
       <input type="password" name="password" placeholder="Senha de administrador" required autofocus>
@@ -269,7 +408,7 @@ def render_dashboard_page(items):
           <td>""" + item['last_seen'] + """</td>
           <td>
             <form method="post" action="/admin/extend/""" + item['machine_id'] + """">
-              <button class="btn-extend" type="submit">Liberar 1 mes</button>
+              <button class="btn-extend" type="submit">+ 1 mes</button>
             </form>
             <form method="post" action="/admin/revoke/""" + item['machine_id'] + """">
               <button class="btn-revoke" type="submit">Revogar</button>
@@ -280,17 +419,19 @@ def render_dashboard_page(items):
           </td>
         </tr>"""
     return """<!DOCTYPE html>
-<html lang="pt-br"><head><meta charset="UTF-8"><title>Painel de Licencas</title>""" + PAGE_STYLE + """</head>
+<html lang="pt-br"><head><meta charset="UTF-8"><title>Painel - EADMT4-PRO</title>""" + PAGE_STYLE + """</head>
 <body>
-  <h1>Painel de Licencas &mdash; EADMT4-PRO</h1>
-  <div class="sub">""" + str(len(items)) + """ maquina(s) registrada(s) &nbsp;&bull;&nbsp; <a class="logout" href="/admin/keys">Gerenciar chaves</a> &nbsp;&bull;&nbsp; <a class="logout" href="/admin/logout">Sair</a></div>
-  <table>
-    <thead>
-      <tr><th>Computador</th><th>ID da maquina</th><th>Chave</th><th>Status</th><th>Teste expira</th>
-          <th>Licenca expira</th><th>Ultima conexao</th><th>Acoes</th></tr>
-    </thead>
-    <tbody>""" + rows_html + """</tbody>
-  </table>
+  <div class="wrapper">
+    <h1>EADMT4-PRO</h1>
+    <div class="sub">""" + str(len(items)) + """ maquina(s) registrada(s) &nbsp;&bull;&nbsp; <a href="/admin/keys">Gerenciar chaves</a> &nbsp;&bull;&nbsp; <a href="/admin/logout">Sair</a></div>
+    <table>
+      <thead>
+        <tr><th>Computador</th><th>ID da maquina</th><th>Chave</th><th>Status</th><th>Teste expira</th>
+            <th>Licenca expira</th><th>Ultima conexao</th><th>Acoes</th></tr>
+      </thead>
+      <tbody>""" + rows_html + """</tbody>
+    </table>
+  </div>
 </body></html>"""
 
 
@@ -301,7 +442,7 @@ def render_keys_page(keys):
     for k in keys:
         rows_html += """
         <tr>
-          <td><span class="mono" style="max-width:220px" onclick="navigator.clipboard.writeText(this.textContent);var m=this.nextElementSibling;m.style.display='inline';setTimeout(function(){m.style.display='none';},1200);">""" + escape(k['license_key']) + """</span><span class="copied-msg">Copiado!</span></td>
+          <td><span class="mono" style="max-width:260px" onclick="navigator.clipboard.writeText(this.textContent);var m=this.nextElementSibling;m.style.display='inline';setTimeout(function(){m.style.display='none';},1200);">""" + escape(k['license_key']) + """</span><span class="copied-msg">Copiado!</span></td>
           <td>""" + k['expires'] + """</td>
           <td>""" + k['machines'] + """</td>
           <td><span class="badge """ + k['status_class'] + """">""" + escape(k['status']) + """</span></td>
@@ -312,19 +453,21 @@ def render_keys_page(keys):
           </td>
         </tr>"""
     return """<!DOCTYPE html>
-<html lang="pt-br"><head><meta charset="UTF-8"><title>Chaves - Painel de Licencas</title>""" + PAGE_STYLE + """</head>
+<html lang="pt-br"><head><meta charset="UTF-8"><title>Chaves - EADMT4-PRO</title>""" + PAGE_STYLE + """</head>
 <body>
-  <h1>Chaves de Licenca &mdash; EADMT4-PRO</h1>
-  <div class="sub">Cada chave libera o app em ate """ + str(MAX_MACHINES_PER_KEY) + """ maquinas. Clique na chave para copiar. &nbsp;&bull;&nbsp; <a class="logout" href="/admin">Voltar</a></div>
-  <form method="post" action="/admin/keygen" style="margin-bottom:16px">
-    <button class="btn-new" type="submit">+ Gerar nova chave (30 dias)</button>
-  </form>
-  <table>
-    <thead>
-      <tr><th>Chave</th><th>Expira em</th><th>Maquinas</th><th>Status</th><th>Acoes</th></tr>
-    </thead>
-    <tbody>""" + rows_html + """</tbody>
-  </table>
+  <div class="wrapper">
+    <h1>EADMT4-PRO</h1>
+    <div class="sub">Chaves de licenca. Cada chave libera o app em ate """ + str(MAX_MACHINES_PER_KEY) + """ maquinas. Clique na chave para copiar. &nbsp;&bull;&nbsp; <a href="/admin">Voltar</a></div>
+    <form method="post" action="/admin/keygen" style="margin-bottom:20px">
+      <button class="btn-new" type="submit">+ Gerar nova chave (30 dias)</button>
+    </form>
+    <table>
+      <thead>
+        <tr><th>Chave</th><th>Expira em</th><th>Maquinas</th><th>Status</th><th>Acoes</th></tr>
+      </thead>
+      <tbody>""" + rows_html + """</tbody>
+    </table>
+  </div>
 </body></html>"""
 
 
