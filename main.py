@@ -11,7 +11,7 @@ from itsdangerous import URLSafeSerializer, BadSignature
 from pydantic import BaseModel
 
 # ----------------------------------------------------------------------
-# Configuração
+# Configuração (via variáveis de ambiente no Render)
 # ----------------------------------------------------------------------
 TURSO_DATABASE_URL = os.environ.get("TURSO_DATABASE_URL")
 TURSO_AUTH_TOKEN = os.environ.get("TURSO_AUTH_TOKEN")
@@ -230,6 +230,7 @@ PAGE_STYLE = """
           max-width: 140px; overflow:hidden; text-overflow: ellipsis; white-space: nowrap;
           display:inline-block; vertical-align:middle; }
   .mono:hover { color:#e5e7eb; text-decoration: underline dotted; }
+  .copied-msg { color:#22c55e; font-size:10px; margin-left:6px; display:none; }
   a.logout { color:#94a3b8; font-size:12px; }
   .login-box { background:#1f2937; padding:32px; border-radius:10px; width:300px;
                box-shadow:0 4px 20px rgba(0,0,0,.4); margin: 10vh auto; }
@@ -265,7 +266,7 @@ def render_dashboard_page(items):
         rows_html += """
         <tr>
           <td>""" + escape(item['machine_name']) + """</td>
-          <td><span class="mono" title=\"""" + escape(item['machine_id']) + """\" onclick="navigator.clipboard.writeText(this.textContent);">""" + escape(item['machine_id']) + """</span></td>
+          <td><span class="mono" title=\"""" + escape(item['machine_id']) + """\" onclick="navigator.clipboard.writeText(this.textContent);var m=this.nextElementSibling;m.style.display='inline';setTimeout(function(){m.style.display='none';},1200);">""" + escape(item['machine_id']) + """</span><span class="copied-msg">Copiado!</span></td>
           <td>""" + escape(item['license_key']) + """</td>
           <td><span class="badge """ + item['status_class'] + """">""" + escape(item['status']) + """</span></td>
           <td>""" + item['trial_expires'] + """</td>
@@ -305,7 +306,7 @@ def render_keys_page(keys):
     for k in keys:
         rows_html += """
         <tr>
-          <td><span class="mono" style="max-width:220px" onclick="navigator.clipboard.writeText(this.textContent);">""" + escape(k['license_key']) + """</span></td>
+          <td><span class="mono" style="max-width:220px" onclick="navigator.clipboard.writeText(this.textContent);var m=this.nextElementSibling;m.style.display='inline';setTimeout(function(){m.style.display='none';},1200);">""" + escape(k['license_key']) + """</span><span class="copied-msg">Copiado!</span></td>
           <td>""" + k['expires'] + """</td>
           <td>""" + k['machines'] + """</td>
           <td><span class="badge """ + k['status_class'] + """">""" + escape(k['status']) + """</span></td>
@@ -400,104 +401,4 @@ def dashboard(_=Depends(require_admin)):
     return HTMLResponse(render_dashboard_page(items))
 
 
-@app.get("/admin/keys", response_class=HTMLResponse)
-def keys_page(_=Depends(require_admin)):
-    conn = get_db()
-    rows = conn.execute("SELECT * FROM license_keys ORDER BY created DESC").fetchall()
-    counts = {}
-    for lk, c in conn.execute(
-        "SELECT license_key, COUNT(*) FROM licenses WHERE license_key IS NOT NULL GROUP BY license_key"
-    ).fetchall():
-        counts[lk] = c
-    conn.close()
-    now = now_utc()
-    keys = []
-    for r_raw in rows:
-        k = row_to_dict(r_raw, KEY_COLUMNS)
-        exp = parse_dt(k["expires"])
-        if k["revoked"]:
-            status, status_class = "revogada", "revogado"
-        elif exp is None:
-            status, status_class = "aguardando 1o uso", "pendente"
-        elif exp > now:
-            status, status_class = "ativa", "ativo"
-        else:
-            status, status_class = "expirada", "expirado"
-        used = counts.get(k["license_key"], 0)
-        keys.append(
-            {
-                "license_key": k["license_key"],
-                "expires": exp.strftime("%d/%m/%Y %H:%M") if exp else "-",
-                "machines": str(used) + "/" + str(k["max_machines"] or MAX_MACHINES_PER_KEY),
-                "status": status,
-                "status_class": status_class,
-            }
-        )
-    return HTMLResponse(render_keys_page(keys))
-
-
-@app.post("/admin/keygen")
-def keygen(_=Depends(require_admin)):
-    conn = get_db()
-    conn.execute(
-        "INSERT INTO license_keys (license_key, created, expires, revoked, max_machines) VALUES (?, ?, ?, 0, ?)",
-        (generate_key(), now_utc().isoformat(), None, MAX_MACHINES_PER_KEY),
-    )
-    conn.commit()
-    conn.close()
-    return RedirectResponse(url="/admin/keys", status_code=303)
-
-
-@app.post("/admin/revokekey/{license_key}")
-def revoke_key(license_key: str, _=Depends(require_admin)):
-    conn = get_db()
-    conn.execute("UPDATE license_keys SET revoked = 1 WHERE license_key = ?", (license_key,))
-    conn.commit()
-    conn.close()
-    return RedirectResponse(url="/admin/keys", status_code=303)
-
-
-@app.post("/admin/extend/{machine_id}")
-def extend_license(machine_id: str, _=Depends(require_admin)):
-    conn = get_db()
-    row = row_to_dict(
-        conn.execute("SELECT * FROM licenses WHERE machine_id = ?", (machine_id,)).fetchone(),
-        LICENSE_COLUMNS,
-    )
-    if row is None:
-        conn.close()
-        raise HTTPException(status_code=404, detail="Maquina nao encontrada")
-    now = now_utc()
-    current = parse_dt(row["license_expires"])
-    base = current if current and current > now else now
-    new_expiry = base + timedelta(days=LICENSE_DAYS)
-    conn.execute(
-        "UPDATE licenses SET license_expires = ?, revoked = 0 WHERE machine_id = ?",
-        (new_expiry.isoformat(), machine_id),
-    )
-    conn.commit()
-    conn.close()
-    return RedirectResponse(url="/admin", status_code=303)
-
-
-@app.post("/admin/revoke/{machine_id}")
-def revoke_license(machine_id: str, _=Depends(require_admin)):
-    conn = get_db()
-    conn.execute("UPDATE licenses SET revoked = 1 WHERE machine_id = ?", (machine_id,))
-    conn.commit()
-    conn.close()
-    return RedirectResponse(url="/admin", status_code=303)
-
-
-@app.post("/admin/reset/{machine_id}")
-def reset_license(machine_id: str, _=Depends(require_admin)):
-    conn = get_db()
-    conn.execute("DELETE FROM licenses WHERE machine_id = ?", (machine_id,))
-    conn.commit()
-    conn.close()
-    return RedirectResponse(url="/admin", status_code=303)
-
-
-@app.api_route("/", methods=["GET", "HEAD"])
-def root():
-    return {"service": "EADMT4-PRO License Server", "status": "ok"}
+@app.get("/admin/keys", response_class=HTMLResponse
