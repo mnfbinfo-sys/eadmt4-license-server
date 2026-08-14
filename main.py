@@ -1,5 +1,5 @@
 import os
-import sqlite3
+import libsql
 from datetime import datetime, timedelta, timezone
 from html import escape
 
@@ -11,7 +11,8 @@ from pydantic import BaseModel
 # ----------------------------------------------------------------------
 # Configuração (via variáveis de ambiente no Render)
 # ----------------------------------------------------------------------
-DB_PATH = os.environ.get("DB_PATH", "licenses.db")
+TURSO_DATABASE_URL = os.environ.get("TURSO_DATABASE_URL")
+TURSO_AUTH_TOKEN = os.environ.get("TURSO_AUTH_TOKEN")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "troque-esta-senha")
 SECRET_KEY = os.environ.get("SECRET_KEY", "troque-este-secret-tambem")
 
@@ -22,47 +23,35 @@ serializer = URLSafeSerializer(SECRET_KEY, salt="admin-session")
 
 app = FastAPI(title="EADMT4-PRO License Server")
 
+# Mapeamento das colunas para garantir compatibilidade com qualquer driver SQL
+LICENSE_COLUMNS = [
+    "machine_id", "machine_name", "first_seen",
+    "trial_expires", "license_expires", "last_seen", "revoked"
+]
 
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    conn = libsql.connect(
+        TURSO_DATABASE_URL,
+        auth_token=TURSO_AUTH_TOKEN,
+    )
     return conn
 
-
-def init_db():
-    conn = get_db()
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS licenses (
-            machine_id TEXT PRIMARY KEY,
-            machine_name TEXT,
-            first_seen TEXT NOT NULL,
-            trial_expires TEXT NOT NULL,
-            license_expires TEXT,
-            last_seen TEXT,
-            revoked INTEGER DEFAULT 0
-        )
-        """
-    )
-    conn.commit()
-    conn.close()
-
-
-init_db()
-
+def row_to_dict(row):
+    """Converte tupla do banco em dicionário para facilitar o acesso por nome."""
+    if not row:
+        return None
+    return dict(zip(LICENSE_COLUMNS, row))
 
 def now_utc():
     return datetime.now(timezone.utc)
 
-
 def parse_dt(s):
+    if not s: return None
     return datetime.fromisoformat(s)
-
 
 class CheckRequest(BaseModel):
     machine_id: str
     machine_name: str = ""
-
 
 # ----------------------------------------------------------------------
 # API usada pelo aplicativo (cliente)
@@ -70,9 +59,10 @@ class CheckRequest(BaseModel):
 @app.post("/api/check")
 def check_license(payload: CheckRequest):
     conn = get_db()
-    row = conn.execute(
+    cursor = conn.execute(
         "SELECT * FROM licenses WHERE machine_id = ?", (payload.machine_id,)
-    ).fetchone()
+    )
+    row = row_to_dict(cursor.fetchone())
     now = now_utc()
 
     if row is None:
@@ -103,13 +93,13 @@ def check_license(payload: CheckRequest):
             status = "revoked"
             expires_at = None
         else:
-            license_expires = parse_dt(row["license_expires"]) if row["license_expires"] else None
+            license_expires = parse_dt(row["license_expires"])
             trial_expires = parse_dt(row["trial_expires"])
 
             if license_expires and license_expires > now:
                 status = "licensed"
                 expires_at = license_expires
-            elif trial_expires > now:
+            elif trial_expires and trial_expires > now:
                 status = "trial"
                 expires_at = trial_expires
             else:
@@ -123,9 +113,8 @@ def check_license(payload: CheckRequest):
         "days_left": max(0, (expires_at - now).days) if expires_at else 0,
     }
 
-
 # ----------------------------------------------------------------------
-# Painel administrativo (HTML gerado direto, sem template engine)
+# Painel administrativo
 # ----------------------------------------------------------------------
 PAGE_STYLE = """
 <style>
@@ -162,7 +151,6 @@ PAGE_STYLE = """
 </style>
 """
 
-
 def render_login_page(error=None):
     error_html = '<div class="error">' + escape(error) + '</div>' if error else ""
     return """<!DOCTYPE html>
@@ -177,7 +165,6 @@ def render_login_page(error=None):
     </form>
   </div>
 </body></html>"""
-
 
 def render_dashboard_page(items):
     rows_html = ""
@@ -216,7 +203,6 @@ def render_dashboard_page(items):
   </table>
 </body></html>"""
 
-
 def require_admin(request: Request):
     token = request.cookies.get("admin_session")
     if token:
@@ -228,11 +214,9 @@ def require_admin(request: Request):
             pass
     raise HTTPException(status_code=303, headers={"Location": "/admin/login"})
 
-
 @app.get("/admin/login", response_class=HTMLResponse)
 def login_form():
     return render_login_page()
-
 
 @app.post("/admin/login")
 def login(password: str = Form(...)):
@@ -243,32 +227,35 @@ def login(password: str = Form(...)):
     resp.set_cookie("admin_session", token, httponly=True, max_age=60 * 60 * 8)
     return resp
 
-
 @app.get("/admin/logout")
 def logout():
     resp = RedirectResponse(url="/admin/login", status_code=303)
     resp.delete_cookie("admin_session")
     return resp
 
-
 @app.get("/admin", response_class=HTMLResponse)
 def dashboard(_=Depends(require_admin)):
     conn = get_db()
-    rows = conn.execute("SELECT * FROM licenses ORDER BY last_seen DESC").fetchall()
+    cursor = conn.execute("SELECT * FROM licenses ORDER BY last_seen DESC")
+    rows_raw = cursor.fetchall()
     conn.close()
+    
     now = now_utc()
     items = []
-    for r in rows:
-        license_expires = parse_dt(r["license_expires"]) if r["license_expires"] else None
+    for r_raw in rows_raw:
+        r = row_to_dict(r_raw)
+        license_expires = parse_dt(r["license_expires"])
         trial_expires = parse_dt(r["trial_expires"])
+        
         if r["revoked"]:
             status, status_class = "revogado", "revogado"
         elif license_expires and license_expires > now:
             status, status_class = "licenciado", "licenciado"
-        elif trial_expires > now:
+        elif trial_expires and trial_expires > now:
             status, status_class = "em teste", "trial"
         else:
             status, status_class = "expirado", "expirado"
+            
         items.append(
             {
                 "machine_id": r["machine_id"],
@@ -276,26 +263,27 @@ def dashboard(_=Depends(require_admin)):
                 "last_seen": (r["last_seen"] or "")[:16].replace("T", " "),
                 "status": status,
                 "status_class": status_class,
-                "license_expires": license_expires.strftime("%d/%m/%Y %H:%M")
-                if license_expires
-                else "-",
-                "trial_expires": trial_expires.strftime("%d/%m/%Y %H:%M"),
+                "license_expires": license_expires.strftime("%d/%m/%Y %H:%M") if license_expires else "-",
+                "trial_expires": trial_expires.strftime("%d/%m/%Y %H:%M") if trial_expires else "-",
             }
         )
     return HTMLResponse(render_dashboard_page(items))
 
-
 @app.post("/admin/extend/{machine_id}")
 def extend_license(machine_id: str, _=Depends(require_admin)):
     conn = get_db()
-    row = conn.execute("SELECT * FROM licenses WHERE machine_id = ?", (machine_id,)).fetchone()
+    cursor = conn.execute("SELECT * FROM licenses WHERE machine_id = ?", (machine_id,))
+    row = row_to_dict(cursor.fetchone())
+    
     if row is None:
         conn.close()
         raise HTTPException(status_code=404, detail="Maquina nao encontrada")
+        
     now = now_utc()
-    current = parse_dt(row["license_expires"]) if row["license_expires"] else now
-    base = current if current > now else now
+    current = parse_dt(row["license_expires"])
+    base = current if current and current > now else now
     new_expiry = base + timedelta(days=LICENSE_DAYS)
+    
     conn.execute(
         "UPDATE licenses SET license_expires = ?, revoked = 0 WHERE machine_id = ?",
         (new_expiry.isoformat(), machine_id),
@@ -303,7 +291,6 @@ def extend_license(machine_id: str, _=Depends(require_admin)):
     conn.commit()
     conn.close()
     return RedirectResponse(url="/admin", status_code=303)
-
 
 @app.post("/admin/revoke/{machine_id}")
 def revoke_license(machine_id: str, _=Depends(require_admin)):
@@ -313,7 +300,6 @@ def revoke_license(machine_id: str, _=Depends(require_admin)):
     conn.close()
     return RedirectResponse(url="/admin", status_code=303)
 
-
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 def root():
     return {"service": "EADMT4-PRO License Server", "status": "ok"}
