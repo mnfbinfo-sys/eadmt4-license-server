@@ -401,4 +401,5 @@ def dashboard(_=Depends(require_admin)):
     return HTMLResponse(render_dashboard_page(items))
 
 
-@app.get("/admin/keys", response_class=HTMLResponse
+   @app.get("/admin/keys", response_class=HTMLResponse)
+   def keys_page(_=Depends(require_admin)):
