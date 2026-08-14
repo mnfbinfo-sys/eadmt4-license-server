@@ -74,7 +74,6 @@ def check_license(payload: CheckRequest):
     now = now_utc()
     key = (payload.license_key or "").strip().upper()
 
-    # Valida a chave, se enviada
     key_row = None
     key_error = None
     if key:
@@ -96,7 +95,6 @@ def check_license(payload: CheckRequest):
         LICENSE_COLUMNS,
     )
 
-    # ---------- FLUXO COM CHAVE ----------
     if key and key_error:
         conn.close()
         return {"status": key_error, "expires_at": None, "days_left": 0}
@@ -104,7 +102,6 @@ def check_license(payload: CheckRequest):
     if key and key_row:
         kexp = parse_dt(key_row["expires"])
         if kexp is None:
-            # chave nunca usada: comeca a contar 30 dias agora
             kexp = now + timedelta(days=LICENSE_DAYS)
             conn.execute(
                 "UPDATE license_keys SET expires = ? WHERE license_key = ?",
@@ -140,7 +137,6 @@ def check_license(payload: CheckRequest):
                 "days_left": max(0, (kexp - now).days),
             }
 
-        # maquina ja existe: atualiza e vincula a chave
         conn.execute(
             "UPDATE licenses SET last_seen = ?, machine_name = ?, license_key = ?, license_expires = ?, revoked = 0 "
             "WHERE machine_id = ?",
@@ -154,7 +150,6 @@ def check_license(payload: CheckRequest):
             "days_left": max(0, (kexp - now).days),
         }
 
-    # ---------- FLUXO ANTIGO (sem chave) ----------
     if row is None:
         first_seen = now
         trial_expires = now + timedelta(days=TRIAL_DAYS)
@@ -401,5 +396,104 @@ def dashboard(_=Depends(require_admin)):
     return HTMLResponse(render_dashboard_page(items))
 
 
-   @app.get("/admin/keys", response_class=HTMLResponse)
-   def keys_page(_=Depends(require_admin)):
+@app.get("/admin/keys", response_class=HTMLResponse)
+def keys_page(_=Depends(require_admin)):
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM license_keys ORDER BY created DESC").fetchall()
+    counts = {}
+    for lk, c in conn.execute(
+        "SELECT license_key, COUNT(*) FROM licenses WHERE license_key IS NOT NULL GROUP BY license_key"
+    ).fetchall():
+        counts[lk] = c
+    conn.close()
+    now = now_utc()
+    keys = []
+    for r_raw in rows:
+        k = row_to_dict(r_raw, KEY_COLUMNS)
+        exp = parse_dt(k["expires"])
+        if k["revoked"]:
+            status, status_class = "revogada", "revogado"
+        elif exp is None:
+            status, status_class = "aguardando 1o uso", "pendente"
+        elif exp > now:
+            status, status_class = "ativa", "ativo"
+        else:
+            status, status_class = "expirada", "expirado"
+        used = counts.get(k["license_key"], 0)
+        keys.append(
+            {
+                "license_key": k["license_key"],
+                "expires": exp.strftime("%d/%m/%Y %H:%M") if exp else "-",
+                "machines": str(used) + "/" + str(k["max_machines"] or MAX_MACHINES_PER_KEY),
+                "status": status,
+                "status_class": status_class,
+            }
+        )
+    return HTMLResponse(render_keys_page(keys))
+
+
+@app.post("/admin/keygen")
+def keygen(_=Depends(require_admin)):
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO license_keys (license_key, created, expires, revoked, max_machines) VALUES (?, ?, ?, 0, ?)",
+        (generate_key(), now_utc().isoformat(), None, MAX_MACHINES_PER_KEY),
+    )
+    conn.commit()
+    conn.close()
+    return RedirectResponse(url="/admin/keys", status_code=303)
+
+
+@app.post("/admin/revokekey/{license_key}")
+def revoke_key(license_key: str, _=Depends(require_admin)):
+    conn = get_db()
+    conn.execute("UPDATE license_keys SET revoked = 1 WHERE license_key = ?", (license_key,))
+    conn.commit()
+    conn.close()
+    return RedirectResponse(url="/admin/keys", status_code=303)
+
+
+@app.post("/admin/extend/{machine_id}")
+def extend_license(machine_id: str, _=Depends(require_admin)):
+    conn = get_db()
+    row = row_to_dict(
+        conn.execute("SELECT * FROM licenses WHERE machine_id = ?", (machine_id,)).fetchone(),
+        LICENSE_COLUMNS,
+    )
+    if row is None:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Maquina nao encontrada")
+    now = now_utc()
+    current = parse_dt(row["license_expires"])
+    base = current if current and current > now else now
+    new_expiry = base + timedelta(days=LICENSE_DAYS)
+    conn.execute(
+        "UPDATE licenses SET license_expires = ?, revoked = 0 WHERE machine_id = ?",
+        (new_expiry.isoformat(), machine_id),
+    )
+    conn.commit()
+    conn.close()
+    return RedirectResponse(url="/admin", status_code=303)
+
+
+@app.post("/admin/revoke/{machine_id}")
+def revoke_license(machine_id: str, _=Depends(require_admin)):
+    conn = get_db()
+    conn.execute("UPDATE licenses SET revoked = 1 WHERE machine_id = ?", (machine_id,))
+    conn.commit()
+    conn.close()
+    return RedirectResponse(url="/admin", status_code=303)
+
+
+@app.post("/admin/reset/{machine_id}")
+def reset_license(machine_id: str, _=Depends(require_admin)):
+    conn = get_db()
+    conn.execute("DELETE FROM licenses WHERE machine_id = ?", (machine_id,))
+    conn.commit()
+    conn.close()
+    return RedirectResponse(url="/admin", status_code=303)
+
+
+@app.api_route("/", methods=["GET", "HEAD"])
+def root():
+    return {"service": "EADMT4-PRO License Server", "status": "ok"}
