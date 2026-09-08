@@ -1,3 +1,5 @@
+import hashlib
+import hmac
 import os
 import secrets
 import string
@@ -14,6 +16,11 @@ TURSO_DATABASE_URL = os.environ.get("TURSO_DATABASE_URL")
 TURSO_AUTH_TOKEN = os.environ.get("TURSO_AUTH_TOKEN")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "troque-esta-senha")
 SECRET_KEY = os.environ.get("SECRET_KEY", "troque-este-secret-tambem")
+
+# Precisa ser EXATAMENTE a mesma string configurada em HEARTBEAT_SECRET no .mq4.
+# Já existe configurada no Render (vimos no painel de Environment Variables) -
+# só precisa bater com o #define HEARTBEAT_SECRET do EA.
+HEARTBEAT_SECRET = os.environ.get("HEARTBEAT_SECRET", "troque-este-secret-do-heartbeat")
 
 TRIAL_DAYS = 2
 LICENSE_DAYS = 30
@@ -56,6 +63,39 @@ def generate_key():
     return "EAD-" + part() + "-" + part() + "-" + part()
 
 
+def sign_heartbeat(status: str, machine_id: str, timestamp: int) -> str:
+    """
+    Assina status|machine_id|timestamp com HMAC-SHA256, usando HEARTBEAT_SECRET.
+    O EA (.mq4) recalcula esse mesmo HMAC e compara - só aceita o heartbeat se bater.
+    Isso impede que alguem escreva manualmente um eadmt4_license.txt falso, porque
+    sem conhecer HEARTBEAT_SECRET não da pra forjar uma assinatura valida.
+    """
+    payload = f"{status}|{machine_id}|{timestamp}"
+    return hmac.new(
+        HEARTBEAT_SECRET.encode("utf-8"),
+        payload.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def signed_response(status: str, machine_id: str, expires_at=None, days_left: int = 0) -> dict:
+    """
+    Monta a resposta padrao do /api/check, sempre incluindo 'sig' e 'timestamp'
+    assinados - o timestamp e gerado AQUI (pelo servidor), nao pelo cliente Python,
+    exatamente para que o cliente nao possa forjar um timestamp e pedir pro
+    servidor assinar algo que ele escolheu.
+    """
+    timestamp = int(now_utc().timestamp())
+    sig = sign_heartbeat(status, machine_id, timestamp)
+    return {
+        "status": status,
+        "expires_at": expires_at.isoformat() if expires_at else None,
+        "days_left": days_left,
+        "timestamp": timestamp,
+        "sig": sig,
+    }
+
+
 class CheckRequest(BaseModel):
     machine_id: str
     machine_name: str = ""
@@ -91,7 +131,7 @@ def check_license(payload: CheckRequest):
 
     if key and key_error:
         conn.close()
-        return {"status": key_error, "expires_at": None, "days_left": 0}
+        return signed_response(key_error, payload.machine_id)
 
     if key and key_row:
         kexp = parse_dt(key_row["expires"])
@@ -109,7 +149,7 @@ def check_license(payload: CheckRequest):
             if count >= int(key_row["max_machines"] or MAX_MACHINES_PER_KEY):
                 conn.commit()
                 conn.close()
-                return {"status": "limit", "expires_at": None, "days_left": 0}
+                return signed_response("limit", payload.machine_id)
             conn.execute(
                 "INSERT INTO licenses (machine_id, machine_name, first_seen, trial_expires, license_expires, last_seen, license_key) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -125,11 +165,7 @@ def check_license(payload: CheckRequest):
             )
             conn.commit()
             conn.close()
-            return {
-                "status": "licensed",
-                "expires_at": kexp.isoformat(),
-                "days_left": max(0, (kexp - now).days),
-            }
+            return signed_response("licensed", payload.machine_id, kexp, max(0, (kexp - now).days))
 
         conn.execute(
             "UPDATE licenses SET last_seen = ?, machine_name = ?, license_key = ?, license_expires = ?, revoked = 0 "
@@ -138,11 +174,7 @@ def check_license(payload: CheckRequest):
         )
         conn.commit()
         conn.close()
-        return {
-            "status": "licensed",
-            "expires_at": kexp.isoformat(),
-            "days_left": max(0, (kexp - now).days),
-        }
+        return signed_response("licensed", payload.machine_id, kexp, max(0, (kexp - now).days))
 
     if row is None:
         first_seen = now
@@ -180,11 +212,8 @@ def check_license(payload: CheckRequest):
                 expires_at = None
 
     conn.close()
-    return {
-        "status": status,
-        "expires_at": expires_at.isoformat() if expires_at else None,
-        "days_left": max(0, (expires_at - now).days) if expires_at else 0,
-    }
+    days_left = max(0, (expires_at - now).days) if expires_at else 0
+    return signed_response(status, payload.machine_id, expires_at, days_left)
 
 
 # ----------------------------------------------------------------------
@@ -490,11 +519,13 @@ def login_form():
 
 @app.post("/admin/login")
 def login(password: str = Form(...)):
-    if password != ADMIN_PASSWORD:
+    # hmac.compare_digest evita timing attack na comparacao da senha
+    if not hmac.compare_digest(password, ADMIN_PASSWORD):
         return HTMLResponse(render_login_page("Senha incorreta"))
     token = serializer.dumps({"ok": True})
     resp = RedirectResponse(url="/admin", status_code=303)
-    resp.set_cookie("admin_session", token, httponly=True, max_age=60 * 60 * 8)
+    resp.set_cookie("admin_session", token, httponly=True, max_age=60 * 60 * 8,
+                     secure=True, samesite="lax")
     return resp
 
 
