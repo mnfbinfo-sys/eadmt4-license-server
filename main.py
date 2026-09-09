@@ -3,7 +3,9 @@ import hmac
 import os
 import secrets
 import string
+import time
 import libsql
+from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from html import escape
 
@@ -25,6 +27,36 @@ HEARTBEAT_SECRET = os.environ.get("HEARTBEAT_SECRET", "troque-este-secret-do-hea
 TRIAL_DAYS = 2
 LICENSE_DAYS = 30
 MAX_MACHINES_PER_KEY = 2
+
+# ----------------------------------------------------------------------
+# Rate limiting simples, em memoria (sem dependencia externa). Funciona por
+# IP, com janela deslizante. Como o Render roda uma unica instancia nesse
+# plano, isso e suficiente; nao persiste entre reinicios, o que e aceitavel
+# para esse caso de uso (nao e uma API publica de alto trafego).
+# ----------------------------------------------------------------------
+RATE_LIMIT_WINDOW_SEC = 60
+LOGIN_MAX_ATTEMPTS = 5      # tentativas de senha por IP por minuto
+CHECK_MAX_REQUESTS = 30     # chamadas de /api/check por IP por minuto
+
+_login_attempts = defaultdict(deque)
+_check_requests = defaultdict(deque)
+
+
+def _client_ip(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
+
+
+def _is_rate_limited(store: dict, key: str, max_requests: int,
+                      window: int = RATE_LIMIT_WINDOW_SEC) -> bool:
+    now = time.time()
+    dq = store[key]
+    while dq and now - dq[0] > window:
+        dq.popleft()
+    if len(dq) >= max_requests:
+        return True
+    dq.append(now)
+    return False
+
 
 serializer = URLSafeSerializer(SECRET_KEY, salt="admin-session")
 
@@ -103,7 +135,13 @@ class CheckRequest(BaseModel):
 
 
 @app.post("/api/check")
-def check_license(payload: CheckRequest):
+def check_license(request: Request, payload: CheckRequest):
+    if _is_rate_limited(_check_requests, _client_ip(request), CHECK_MAX_REQUESTS):
+        # Nao expoe detalhe de rate-limit pro cliente; apenas retorna erro
+        # generico, no mesmo formato que uma falha de rede daria.
+        return {"status": "error", "expires_at": None, "days_left": 0,
+                "sig": "", "timestamp": None}
+
     conn = get_db()
     now = now_utc()
     key = (payload.license_key or "").strip().upper()
@@ -421,7 +459,8 @@ def render_login_page(error=None):
 </body></html>"""
 
 
-def render_dashboard_page(items):
+def render_dashboard_page(items, csrf_token=""):
+    csrf_field = '<input type="hidden" name="csrf_token" value="' + escape(csrf_token) + '">'
     rows_html = ""
     if not items:
         rows_html = '<tr><td colspan="8">Nenhuma maquina se conectou ainda.</td></tr>'
@@ -437,12 +476,15 @@ def render_dashboard_page(items):
           <td>""" + item['last_seen'] + """</td>
           <td>
             <form method="post" action="/admin/extend/""" + item['machine_id'] + """">
+              """ + csrf_field + """
               <button class="btn-extend" type="submit">+ 1 mes</button>
             </form>
             <form method="post" action="/admin/revoke/""" + item['machine_id'] + """">
+              """ + csrf_field + """
               <button class="btn-revoke" type="submit">Revogar</button>
             </form>
             <form method="post" action="/admin/reset/""" + item['machine_id'] + """">
+              """ + csrf_field + """
               <button class="btn-reset" type="submit">Resetar</button>
             </form>
           </td>
@@ -464,7 +506,8 @@ def render_dashboard_page(items):
 </body></html>"""
 
 
-def render_keys_page(keys):
+def render_keys_page(keys, csrf_token=""):
+    csrf_field = '<input type="hidden" name="csrf_token" value="' + escape(csrf_token) + '">'
     rows_html = ""
     if not keys:
         rows_html = '<tr><td colspan="5">Nenhuma chave criada ainda. Clique em "Gerar nova chave".</td></tr>'
@@ -477,6 +520,7 @@ def render_keys_page(keys):
           <td><span class="badge """ + k['status_class'] + """">""" + escape(k['status']) + """</span></td>
           <td>
             <form method="post" action="/admin/revokekey/""" + escape(k['license_key']) + """">
+              """ + csrf_field + """
               <button class="btn-revoke" type="submit">Revogar</button>
             </form>
           </td>
@@ -488,6 +532,7 @@ def render_keys_page(keys):
     <h1>EADMT4-PRO</h1>
     <div class="sub">Chaves de licenca. Cada chave libera o app em ate """ + str(MAX_MACHINES_PER_KEY) + """ maquinas. Clique na chave para copiar. &nbsp;&bull;&nbsp; <a href="/admin">Voltar</a></div>
     <form method="post" action="/admin/keygen" style="margin-bottom:20px">
+      """ + csrf_field + """
       <button class="btn-new" type="submit">+ Gerar nova chave (30 dias)</button>
     </form>
     <table>
@@ -500,16 +545,31 @@ def render_keys_page(keys):
 </body></html>"""
 
 
-def require_admin(request: Request):
+def require_admin(request: Request) -> dict:
     token = request.cookies.get("admin_session")
     if token:
         try:
             data = serializer.loads(token)
             if data.get("ok"):
-                return True
+                return data
         except BadSignature:
             pass
     raise HTTPException(status_code=303, headers={"Location": "/admin/login"})
+
+
+def require_admin_csrf(request: Request, csrf_token: str = Form(...)) -> dict:
+    """
+    Para rotas POST que alteram estado: valida a sessao (cookie) E o token
+    CSRF enviado no proprio formulario. O token fica embutido como campo
+    hidden em cada form (ver render_dashboard_page/render_keys_page) e tem
+    que bater com o que esta guardado dentro do cookie assinado da sessao -
+    um site malicioso induzindo o navegador do admin a fazer o POST nao
+    teria como saber esse valor, entao a requisicao forjada e rejeitada.
+    """
+    session = require_admin(request)
+    if not hmac.compare_digest(csrf_token, session.get("csrf", "")):
+        raise HTTPException(status_code=403, detail="Token CSRF invalido ou ausente.")
+    return session
 
 
 @app.get("/admin/login", response_class=HTMLResponse)
@@ -518,11 +578,15 @@ def login_form():
 
 
 @app.post("/admin/login")
-def login(password: str = Form(...)):
+def login(request: Request, password: str = Form(...)):
+    if _is_rate_limited(_login_attempts, _client_ip(request), LOGIN_MAX_ATTEMPTS):
+        return HTMLResponse(render_login_page("Muitas tentativas. Aguarde um minuto e tente de novo."),
+                             status_code=429)
     # hmac.compare_digest evita timing attack na comparacao da senha
     if not hmac.compare_digest(password, ADMIN_PASSWORD):
         return HTMLResponse(render_login_page("Senha incorreta"))
-    token = serializer.dumps({"ok": True})
+    csrf_token = secrets.token_urlsafe(32)
+    token = serializer.dumps({"ok": True, "csrf": csrf_token})
     resp = RedirectResponse(url="/admin", status_code=303)
     resp.set_cookie("admin_session", token, httponly=True, max_age=60 * 60 * 8,
                      secure=True, samesite="lax")
@@ -537,7 +601,7 @@ def logout():
 
 
 @app.get("/admin", response_class=HTMLResponse)
-def dashboard(_=Depends(require_admin)):
+def dashboard(session=Depends(require_admin)):
     conn = get_db()
     rows = conn.execute("SELECT * FROM licenses ORDER BY last_seen DESC").fetchall()
     conn.close()
@@ -567,11 +631,11 @@ def dashboard(_=Depends(require_admin)):
                 "trial_expires": trial_expires.strftime("%d/%m/%Y %H:%M") if trial_expires else "-",
             }
         )
-    return HTMLResponse(render_dashboard_page(items))
+    return HTMLResponse(render_dashboard_page(items, session.get("csrf", "")))
 
 
 @app.get("/admin/keys", response_class=HTMLResponse)
-def keys_page(_=Depends(require_admin)):
+def keys_page(session=Depends(require_admin)):
     conn = get_db()
     rows = conn.execute("SELECT * FROM license_keys ORDER BY created DESC").fetchall()
     counts = {}
@@ -603,11 +667,11 @@ def keys_page(_=Depends(require_admin)):
                 "status_class": status_class,
             }
         )
-    return HTMLResponse(render_keys_page(keys))
+    return HTMLResponse(render_keys_page(keys, session.get("csrf", "")))
 
 
 @app.post("/admin/keygen")
-def keygen(_=Depends(require_admin)):
+def keygen(_=Depends(require_admin_csrf)):
     conn = get_db()
     conn.execute(
         "INSERT INTO license_keys (license_key, created, expires, revoked, max_machines) VALUES (?, ?, ?, 0, ?)",
@@ -619,7 +683,7 @@ def keygen(_=Depends(require_admin)):
 
 
 @app.post("/admin/revokekey/{license_key}")
-def revoke_key(license_key: str, _=Depends(require_admin)):
+def revoke_key(license_key: str, _=Depends(require_admin_csrf)):
     conn = get_db()
     conn.execute("UPDATE license_keys SET revoked = 1 WHERE license_key = ?", (license_key,))
     conn.commit()
@@ -628,7 +692,7 @@ def revoke_key(license_key: str, _=Depends(require_admin)):
 
 
 @app.post("/admin/extend/{machine_id}")
-def extend_license(machine_id: str, _=Depends(require_admin)):
+def extend_license(machine_id: str, _=Depends(require_admin_csrf)):
     conn = get_db()
     row = row_to_dict(
         conn.execute("SELECT * FROM licenses WHERE machine_id = ?", (machine_id,)).fetchone(),
@@ -651,7 +715,7 @@ def extend_license(machine_id: str, _=Depends(require_admin)):
 
 
 @app.post("/admin/revoke/{machine_id}")
-def revoke_license(machine_id: str, _=Depends(require_admin)):
+def revoke_license(machine_id: str, _=Depends(require_admin_csrf)):
     conn = get_db()
     conn.execute("UPDATE licenses SET revoked = 1 WHERE machine_id = ?", (machine_id,))
     conn.commit()
@@ -660,7 +724,7 @@ def revoke_license(machine_id: str, _=Depends(require_admin)):
 
 
 @app.post("/admin/reset/{machine_id}")
-def reset_license(machine_id: str, _=Depends(require_admin)):
+def reset_license(machine_id: str, _=Depends(require_admin_csrf)):
     conn = get_db()
     conn.execute("DELETE FROM licenses WHERE machine_id = ?", (machine_id,))
     conn.commit()
