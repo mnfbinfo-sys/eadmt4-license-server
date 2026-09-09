@@ -5,7 +5,6 @@ import secrets
 import string
 import time
 import libsql
-from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from html import escape
 from fastapi import FastAPI, Request, Form, HTTPException, Depends
@@ -40,20 +39,44 @@ MAX_MACHINES_PER_KEY = 2
 RATE_LIMIT_WINDOW_SEC = 60
 LOGIN_MAX_ATTEMPTS = 5
 CHECK_MAX_REQUESTS = 30
-_login_attempts = defaultdict(deque)
-_check_requests = defaultdict(deque)
 
 def _client_ip(request: Request) -> str:
+    # ⚠️ IMPORTANTE: no Render (e em qualquer proxy/load balancer na frente da app),
+    # request.client.host é o IP do proxy, não o do visitante real - então TODO mundo
+    # cairia no mesmo "IP" e o rate limit ficaria inútil (ou bloquearia todo mundo de
+    # uma vez por causa de um único atacante). O Render injeta o IP real do cliente no
+    # cabeçalho X-Forwarded-For (primeiro IP da lista = o cliente original).
+    xff = request.headers.get("x-forwarded-for")
+    if xff:
+        first_ip = xff.split(",")[0].strip()
+        if first_ip:
+            return first_ip
     return request.client.host if request.client else "unknown"
 
-def _is_rate_limited(store: dict, key: str, max_requests: int, window: int = RATE_LIMIT_WINDOW_SEC) -> bool:
-    now = time.time()
-    dq = store[key]
-    while dq and now - dq[0] > window:
-        dq.popleft()
-    if len(dq) >= max_requests:
+def _ensure_rate_limit_table(conn):
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS rate_limit_events (bucket TEXT NOT NULL, key TEXT NOT NULL, ts INTEGER NOT NULL)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_rate_limit_bucket_key ON rate_limit_events (bucket, key)"
+    )
+
+def _is_rate_limited(conn, bucket: str, key: str, max_requests: int, window: int = RATE_LIMIT_WINDOW_SEC) -> bool:
+    # Rate limit persistido no banco Turso (em vez de memória do processo), para que:
+    # 1) um restart/deploy não zere os contadores de tentativas de um atacante;
+    # 2) o limite continue correto mesmo se o serviço um dia rodar em mais de uma instância.
+    _ensure_rate_limit_table(conn)
+    now = int(time.time())
+    cutoff = now - window
+    conn.execute("DELETE FROM rate_limit_events WHERE bucket = ? AND ts < ?", (bucket, cutoff))
+    count = conn.execute(
+        "SELECT COUNT(*) FROM rate_limit_events WHERE bucket = ? AND key = ?", (bucket, key)
+    ).fetchone()[0]
+    if count >= max_requests:
+        conn.commit()
         return True
-    dq.append(now)
+    conn.execute("INSERT INTO rate_limit_events (bucket, key, ts) VALUES (?, ?, ?)", (bucket, key, now))
+    conn.commit()
     return False
 
 serializer = URLSafeSerializer(SECRET_KEY, salt="admin-session")
@@ -101,10 +124,11 @@ class CheckRequest(BaseModel):
 
 @app.post("/api/check")
 def check_license(request: Request, payload: CheckRequest):
-    if _is_rate_limited(_check_requests, _client_ip(request), CHECK_MAX_REQUESTS):
-        return {"status": "error", "expires_at": None, "days_left": 0, "sig": "", "timestamp": None}
-    
     conn = get_db()
+    if _is_rate_limited(conn, "check", _client_ip(request), CHECK_MAX_REQUESTS):
+        conn.close()
+        return {"status": "error", "expires_at": None, "days_left": 0, "sig": "", "timestamp": None}
+
     now = now_utc()
     key = (payload.license_key or "").strip().upper()
     key_row = None
@@ -199,7 +223,10 @@ def login_form(): return render_login_page()
 
 @app.post("/admin/login")
 def login(request: Request, password: str = Form(...)):
-    if _is_rate_limited(_login_attempts, _client_ip(request), LOGIN_MAX_ATTEMPTS):
+    conn = get_db()
+    limited = _is_rate_limited(conn, "login", _client_ip(request), LOGIN_MAX_ATTEMPTS)
+    conn.close()
+    if limited:
         return HTMLResponse(render_login_page("Muitas tentativas."), status_code=429)
     if not hmac.compare_digest(password, ADMIN_PASSWORD):
         return HTMLResponse(render_login_page("Senha incorreta"))
