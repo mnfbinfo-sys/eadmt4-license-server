@@ -10,7 +10,7 @@ from html import escape
 from fastapi import FastAPI, Request, Form, HTTPException, Depends
 from fastapi.responses import HTMLResponse, RedirectResponse
 from itsdangerous import URLSafeSerializer, BadSignature
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 # Configurações - Certifique-se que estas variáveis existem no Render!
 # ⚠️ SEGURANÇA: nenhum destes segredos tem valor padrão. Se a variável de ambiente
@@ -79,8 +79,38 @@ def _is_rate_limited(conn, bucket: str, key: str, max_requests: int, window: int
     conn.commit()
     return False
 
+def _ensure_audit_log_table(conn):
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS admin_audit_log (ts INTEGER NOT NULL, ip TEXT, action TEXT NOT NULL, detail TEXT, success INTEGER NOT NULL)"
+    )
+
+def log_admin_action(conn, request: Request, action: str, detail: str = "", success: bool = True):
+    # Registra quem fez o quê e quando no painel admin: se ADMIN_PASSWORD algum dia vazar,
+    # isso é o que permite reconstruir o que foi feito (logins, geração/revogação de chaves, etc.).
+    try:
+        _ensure_audit_log_table(conn)
+        conn.execute(
+            "INSERT INTO admin_audit_log (ts, ip, action, detail, success) VALUES (?, ?, ?, ?, ?)",
+            (int(time.time()), _client_ip(request), action, detail, 1 if success else 0),
+        )
+        conn.commit()
+    except Exception as e:
+        # Falha ao logar nunca deve derrubar a ação administrativa em si.
+        print(f"[AUDIT LOG ERROR] {e}")
+
 serializer = URLSafeSerializer(SECRET_KEY, salt="admin-session")
 app = FastAPI(title="EADMT4-PRO License Server")
+
+@app.middleware("http")
+async def _security_headers_middleware(request: Request, call_next):
+    # Headers de segurança HTTP que o FastAPI não adiciona por padrão.
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    # HSTS só faz sentido se o serviço é sempre servido via HTTPS (é o caso no Render).
+    response.headers["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains"
+    return response
 
 LICENSE_COLUMNS = ["machine_id", "machine_name", "first_seen", "trial_expires", "license_expires", "last_seen", "revoked", "license_key"]
 KEY_COLUMNS = ["license_key", "created", "expires", "revoked", "max_machines"]
@@ -118,9 +148,12 @@ def signed_response(status: str, machine_id: str, expires_at=None, days_left: in
     return {"status": status, "expires_at": expires_at.isoformat() if expires_at else None, "days_left": days_left, "timestamp": timestamp, "sig": sig}
 
 class CheckRequest(BaseModel):
-    machine_id: str
-    machine_name: str = ""
-    license_key: str = ""
+    # Limites de tamanho evitam que alguém envie payloads muito grandes repetidamente
+    # (machine_id é um hash SHA-256 truncado em 32 chars; license_key segue o formato
+    # EAD-XXXX-XXXX-XXXX, então 64 chars já dá folga de sobra para ambos).
+    machine_id: str = Field(..., min_length=1, max_length=128)
+    machine_name: str = Field("", max_length=128)
+    license_key: str = Field("", max_length=64)
 
 @app.post("/api/check")
 def check_license(request: Request, payload: CheckRequest):
@@ -225,11 +258,16 @@ def login_form(): return render_login_page()
 def login(request: Request, password: str = Form(...)):
     conn = get_db()
     limited = _is_rate_limited(conn, "login", _client_ip(request), LOGIN_MAX_ATTEMPTS)
-    conn.close()
     if limited:
+        log_admin_action(conn, request, "login", detail="rate_limited", success=False)
+        conn.close()
         return HTMLResponse(render_login_page("Muitas tentativas."), status_code=429)
     if not hmac.compare_digest(password, ADMIN_PASSWORD):
+        log_admin_action(conn, request, "login", detail="senha_incorreta", success=False)
+        conn.close()
         return HTMLResponse(render_login_page("Senha incorreta"))
+    log_admin_action(conn, request, "login", success=True)
+    conn.close()
     csrf_token = secrets.token_urlsafe(32)
     token = serializer.dumps({"ok": True, "csrf": csrf_token})
     resp = RedirectResponse(url="/admin", status_code=303)
@@ -237,7 +275,16 @@ def login(request: Request, password: str = Form(...)):
     return resp
 
 @app.get("/admin/logout")
-def logout():
+def logout(request: Request):
+    conn = get_db()
+    token = request.cookies.get("admin_session")
+    if token:
+        try:
+            if serializer.loads(token).get("ok"):
+                log_admin_action(conn, request, "logout", success=True)
+        except BadSignature:
+            pass
+    conn.close()
     resp = RedirectResponse(url="/admin/login", status_code=303)
     resp.delete_cookie("admin_session")
     return resp
@@ -267,6 +314,9 @@ def dashboard(session=Depends(require_admin)):
     return HTMLResponse(render_dashboard_page(items, session.get("csrf", "")))
 
 # ... [MANTENHA AS OUTRAS ROTAS ADMIN: /admin/keys, /admin/keygen, etc.] ...
+# ⚠️ IMPORTANTE (auditoria): em cada rota que gera, revoga ou altera uma licença/chave,
+# chame log_admin_action(conn, request, "<ação>", detail="<ex.: license_key ou machine_id afetado>")
+# antes do conn.close(), reaproveitando a mesma tabela admin_audit_log já criada acima.
 
 @app.api_route("/", methods=["GET", "HEAD"])
 def root():
