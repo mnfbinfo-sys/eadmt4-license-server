@@ -2,12 +2,12 @@
 # -*- coding: utf-8 -*-
 """
 EADMT4-PRO License Server - main.py
-Versão: 5.1 (2026-09-11)
+Versão: 5.2 (2026-09-11)
 - Trial automático de 7 dias
 - Captura de lead (nome, email, telefone) no primeiro acesso
 - Status trial_expired quando o trial acaba naturalmente
 - Heartbeat HMAC-SHA256 seguro
-- Painel admin com dados do cliente
+- Painel admin HTML + API REST JSON para o gerenciador local
 """
 import hashlib
 import hmac
@@ -19,8 +19,8 @@ import libsql
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from html import escape
-from fastapi import FastAPI, Request, Form, HTTPException, Depends
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi import FastAPI, Request, Form, HTTPException, Depends, Header
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from itsdangerous import URLSafeSerializer, BadSignature
 from pydantic import BaseModel
 
@@ -30,28 +30,23 @@ from pydantic import BaseModel
 TURSO_DATABASE_URL = os.environ.get("TURSO_DATABASE_URL")
 TURSO_AUTH_TOKEN = os.environ.get("TURSO_AUTH_TOKEN")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "troque-esta-senha")
+ADMIN_API_TOKEN = os.environ.get("ADMIN_API_TOKEN", "")  # ✅ NOVO
 SECRET_KEY = os.environ.get("SECRET_KEY", "troque-este-secret-tambem")
 HEARTBEAT_SECRET = os.environ.get("HEARTBEAT_SECRET", "troque-este-secret-do-heartbeat")
 
-# ✅ Trial de 7 dias
 TRIAL_DAYS = 7
 LICENSE_DAYS = 30
 MAX_MACHINES_PER_KEY = 2
 
-# Rate limiting
 RATE_LIMIT_WINDOW_SEC = 60
 LOGIN_MAX_ATTEMPTS = 5
 CHECK_MAX_REQUESTS = 30
 _login_attempts = defaultdict(deque)
 _check_requests = defaultdict(deque)
 
-# ============================================================================
-# APP FASTAPI
-# ============================================================================
 app = FastAPI(title="EADMT4-PRO License Server")
 serializer = URLSafeSerializer(SECRET_KEY, salt="admin-session")
 
-# Colunas das tabelas
 LICENSE_COLUMNS = [
     "machine_id", "machine_name", "first_seen", "trial_expires",
     "license_expires", "last_seen", "revoked", "license_key",
@@ -84,7 +79,6 @@ def parse_dt(s):
 
 
 def init_db():
-    """Cria as tabelas e adiciona colunas novas se não existirem (migração suave)."""
     conn = get_db()
     conn.execute("""
         CREATE TABLE IF NOT EXISTS licenses (
@@ -111,7 +105,6 @@ def init_db():
             max_machines INTEGER DEFAULT 2
         )
     """)
-    # Migração: adiciona colunas de lead se não existirem
     for col_sql in [
         "ALTER TABLE licenses ADD COLUMN client_name TEXT",
         "ALTER TABLE licenses ADD COLUMN client_email TEXT",
@@ -121,12 +114,11 @@ def init_db():
         try:
             conn.execute(col_sql)
         except Exception:
-            pass  # coluna já existe
+            pass
     conn.commit()
     conn.close()
 
 
-# Inicializa o banco na importação
 init_db()
 
 
@@ -177,7 +169,100 @@ def signed_response(status: str, machine_id: str, expires_at=None, days_left: in
 
 
 # ============================================================================
-# MODELO DE REQUEST
+# AUTENTICAÇÃO API (para o gerenciador local)
+# ============================================================================
+def verify_api_token(x_admin_api_token: str = Header(...)):
+    """Verifica o token da API admin."""
+    if not ADMIN_API_TOKEN:
+        raise HTTPException(status_code=500, detail="ADMIN_API_TOKEN não configurado no servidor")
+    if not hmac.compare_digest(x_admin_api_token, ADMIN_API_TOKEN):
+        raise HTTPException(status_code=401, detail="Token inválido")
+    return True
+
+
+# ============================================================================
+# ✅ ROTAS API REST JSON (para o gerenciador_local.py)
+# ============================================================================
+@app.get("/admin/api/keys")
+def api_list_keys(_=Depends(verify_api_token)):
+    """Lista todas as chaves em formato JSON."""
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM license_keys ORDER BY created DESC").fetchall()
+    counts = {}
+    for lk, c in conn.execute(
+        "SELECT license_key, COUNT(*) FROM licenses WHERE license_key IS NOT NULL GROUP BY license_key"
+    ).fetchall():
+        counts[lk] = c
+    conn.close()
+    keys = []
+    for r_raw in rows:
+        k = row_to_dict(r_raw, KEY_COLUMNS)
+        keys.append({
+            "license_key": k["license_key"],
+            "created": k["created"],
+            "expires": k["expires"],
+            "revoked": bool(k["revoked"]),
+            "max_machines": k["max_machines"] or MAX_MACHINES_PER_KEY,
+            "machines_used": counts.get(k["license_key"], 0),
+        })
+    return {"keys": keys}
+
+
+@app.post("/admin/api/keygen")
+def api_keygen(_=Depends(verify_api_token)):
+    """Gera uma nova chave de licença."""
+    conn = get_db()
+    key = generate_key()
+    conn.execute(
+        "INSERT INTO license_keys (license_key, created, expires, revoked, max_machines) VALUES (?, ?, ?, 0, ?)",
+        (key, now_utc().isoformat(), None, MAX_MACHINES_PER_KEY),
+    )
+    conn.commit()
+    conn.close()
+    return {
+        "license_key": key,
+        "max_machines": MAX_MACHINES_PER_KEY,
+        "created": now_utc().isoformat(),
+    }
+
+
+@app.post("/admin/api/keys/{license_key}/renew")
+def api_renew_key(license_key: str, body: dict = {"days": 30}, _=Depends(verify_api_token)):
+    """Renova uma chave existente (estende a expiração)."""
+    dias = body.get("days", body.get("dias", 30))
+    conn = get_db()
+    row = row_to_dict(
+        conn.execute("SELECT * FROM license_keys WHERE license_key = ?", (license_key,)).fetchone(),
+        KEY_COLUMNS,
+    )
+    if row is None:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Chave não encontrada")
+    now = now_utc()
+    current = parse_dt(row["expires"])
+    base = current if current and current > now else now
+    new_expiry = base + timedelta(days=int(dias))
+    conn.execute(
+        "UPDATE license_keys SET expires = ?, revoked = 0 WHERE license_key = ?",
+        (new_expiry.isoformat(), license_key),
+    )
+    conn.commit()
+    conn.close()
+    return {"license_key": license_key, "expires": new_expiry.isoformat(), "days_added": dias}
+
+
+@app.post("/admin/api/keys/{license_key}/revoke")
+def api_revoke_key(license_key: str, _=Depends(verify_api_token)):
+    """Revoga uma chave."""
+    conn = get_db()
+    conn.execute("UPDATE license_keys SET revoked = 1 WHERE license_key = ?", (license_key,))
+    conn.commit()
+    conn.close()
+    return {"license_key": license_key, "revoked": True}
+
+
+# ============================================================================
+# MODELO DE REQUEST DO CLIENTE
 # ============================================================================
 class CheckRequest(BaseModel):
     machine_id: str
@@ -204,7 +289,6 @@ def check_license(request: Request, payload: CheckRequest):
     key_row = None
     key_error = None
 
-    # Valida chave informada (se houver)
     if key:
         key_row = row_to_dict(
             conn.execute("SELECT * FROM license_keys WHERE license_key = ?", (key,)).fetchone(),
@@ -224,19 +308,14 @@ def check_license(request: Request, payload: CheckRequest):
         LICENSE_COLUMNS,
     )
 
-    # --- Máquina já existe ---
     if row:
-        # Se a máquina foi revogada manualmente, mantém revogada
         if row["revoked"]:
             conn.close()
             return signed_response("revoked", payload.machine_id)
-
-        # Se há erro de chave, retorna o erro
         if key_error:
             conn.close()
             return signed_response(key_error, payload.machine_id)
 
-        # Atualiza last_seen e dados do cliente (se vierem preenchidos)
         updates = ["last_seen = ?"]
         params = [now.isoformat()]
 
@@ -255,7 +334,6 @@ def check_license(request: Request, payload: CheckRequest):
         if key:
             updates.append("license_key = ?")
             params.append(key)
-            # Ativa a licença ao usar uma chave válida
             kexp = parse_dt(key_row["expires"]) if key_row else None
             if kexp is None:
                 kexp = now + timedelta(days=LICENSE_DAYS)
@@ -267,15 +345,13 @@ def check_license(request: Request, payload: CheckRequest):
         conn.execute(f"UPDATE licenses SET {', '.join(updates)} WHERE machine_id = ?", params)
         conn.commit()
 
-        # Determina status atual
-        license_expires = parse_dt(row["license_expires"])
-        trial_expires = parse_dt(row["trial_expires"])
-
-        # Se acabou de ativar com chave, retorna licensed
         if key and key_row:
             kexp = parse_dt(key_row["expires"]) or (now + timedelta(days=LICENSE_DAYS))
             conn.close()
             return signed_response("licensed", payload.machine_id, kexp, max(0, (kexp - now).days))
+
+        license_expires = parse_dt(row["license_expires"])
+        trial_expires = parse_dt(row["trial_expires"])
 
         if license_expires and license_expires > now:
             days = max(0, (license_expires - now).days)
@@ -286,16 +362,13 @@ def check_license(request: Request, payload: CheckRequest):
             conn.close()
             return signed_response("trial", payload.machine_id, trial_expires, days)
         else:
-            # ✅ Trial expirou naturalmente
             conn.close()
             return signed_response("trial_expired", payload.machine_id)
 
-    # --- Máquina nova ---
     if key_error:
         conn.close()
         return signed_response(key_error, payload.machine_id)
 
-    # Cria registro com trial de 7 dias
     trial_expires = now + timedelta(days=TRIAL_DAYS)
     conn.execute(
         """INSERT INTO licenses
@@ -425,9 +498,6 @@ input:focus { outline: none; border-color: var(--deriv-red); }
 """
 
 
-# ============================================================================
-# PÁGINAS HTML
-# ============================================================================
 def render_login_page(error=None):
     error_html = f'<div class="error">{escape(error)}</div>' if error else ""
     return f"""<!DOCTYPE html>
@@ -557,7 +627,7 @@ def render_keys_page(keys, csrf_token=""):
 
 
 # ============================================================================
-# AUTENTICAÇÃO ADMIN
+# AUTENTICAÇÃO ADMIN (painel web)
 # ============================================================================
 def require_admin(request: Request) -> dict:
     token = request.cookies.get("admin_session")
@@ -579,7 +649,7 @@ def require_admin_csrf(request: Request, csrf_token: str = Form(...)) -> dict:
 
 
 # ============================================================================
-# ROTAS ADMIN
+# ROTAS ADMIN (painel web HTML)
 # ============================================================================
 @app.get("/admin/login", response_class=HTMLResponse)
 def login_form():
@@ -624,7 +694,6 @@ def dashboard(session=Depends(require_admin)):
         elif trial_expires and trial_expires > now:
             status, status_class = "em teste", "trial"
         else:
-            # ✅ Trial expirou naturalmente
             status, status_class = "expirado", "expirado"
         items.append({
             "machine_id": r["machine_id"],
