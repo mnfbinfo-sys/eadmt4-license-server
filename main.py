@@ -2,8 +2,10 @@
 # -*- coding: utf-8 -*-
 """
 EADMT4-PRO License Server
-VERSÃO v2.1 - 2026-09-15
-Alterações: Trial automático de 3 dias para novos usuários (sem chave).
+VERSÃO v2.2 - 2026-09-16
+- Trial automático de 3 dias para novos usuários
+- Endpoint /admin/api/reset-all para limpar o banco
+- Painel admin com distinção entre trial/licenciado
 """
 import asyncio
 import hashlib
@@ -21,7 +23,9 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from itsdangerous import URLSafeSerializer, BadSignature
 from pydantic import BaseModel, Field
 
-# Configurações - Certifique-se que estas variáveis existem no Render!
+# ============================================================================
+# CONFIGURAÇÕES - Variáveis de ambiente obrigatórias no Render
+# ============================================================================
 def _require_env(name: str) -> str:
     value = os.environ.get(name)
     if not value:
@@ -42,13 +46,16 @@ ADMIN_API_TOKEN = os.environ.get("ADMIN_API_TOKEN") or ADMIN_PASSWORD
 # ============================================================================
 # CONFIGURAÇÕES DE LICENÇA
 # ============================================================================
-TRIAL_DAYS = 3              # ✅ Trial automático de 3 dias para novos usuários
+TRIAL_DAYS = 3              # Trial automático de 3 dias para novos usuários
 LICENSE_DAYS = 30           # Duração padrão da licença paga (30 dias)
 MAX_MACHINES_PER_KEY = 2    # Máximo de máquinas por chave paga
 RATE_LIMIT_WINDOW_SEC = 60
 LOGIN_MAX_ATTEMPTS = 5
 CHECK_MAX_REQUESTS = 30
 
+# ============================================================================
+# UTILITÁRIOS
+# ============================================================================
 def _client_ip(request: Request) -> str:
     xff = request.headers.get("x-forwarded-for")
     if xff:
@@ -116,6 +123,9 @@ def log_admin_action(conn, request: Request, action: str, detail: str = "", succ
     except Exception as e:
         print(f"[AUDIT LOG ERROR] {e}")
 
+# ============================================================================
+# APP FASTAPI
+# ============================================================================
 serializer = URLSafeSerializer(SECRET_KEY, salt="admin-session")
 app = FastAPI(title="EADMT4-PRO License Server")
 
@@ -133,6 +143,9 @@ async def _on_startup():
     _cleanup_rate_limit_events()
     asyncio.create_task(_rate_limit_cleanup_loop())
 
+# ============================================================================
+# BANCO DE DADOS
+# ============================================================================
 LICENSE_COLUMNS = ["machine_id", "machine_name", "first_seen", "license_expires", "last_seen", "revoked", "license_key", "hardware_fingerprint"]
 KEY_COLUMNS = ["license_key", "created", "expires", "revoked", "max_machines"]
 
@@ -198,6 +211,9 @@ def signed_response(status: str, machine_id: str, expires_at=None, days_left: in
     sig = sign_heartbeat(status, machine_id, timestamp)
     return {"status": status, "expires_at": expires_at.isoformat() if expires_at else None, "days_left": days_left, "timestamp": timestamp, "sig": sig}
 
+# ============================================================================
+# API PÚBLICA - /api/check
+# ============================================================================
 class CheckRequest(BaseModel):
     machine_id: str = Field(..., min_length=1, max_length=128)
     machine_name: str = Field("", max_length=128)
@@ -314,6 +330,7 @@ font-size:14px; cursor:pointer; text-decoration:none; display:inline-block;
 button:hover, .btn:hover { background:#255ac9; }
 .btn-danger { background:#c0392b; } .btn-danger:hover { background:#992d21; }
 .btn-ok { background:#1f9d55; } .btn-ok:hover { background:#187d44; }
+.btn-warning { background:#e6a23c; } .btn-warning:hover { background:#c98a2e; }
 .err { background:#3a1f24; color:#ff9b9b; padding:10px 12px; border-radius:6px; margin-bottom:14px; font-size:13.5px; }
 table { width:100%; border-collapse:collapse; margin-top:10px; font-size:13px; }
 th, td { text-align:left; padding:8px 10px; border-bottom:1px solid #2c3646; }
@@ -454,6 +471,9 @@ def render_keys_page(keys: list, csrf_token: str, message: str = "") -> str:
 </div>
 </body></html>"""
 
+# ============================================================================
+# AUTENTICAÇÃO ADMIN
+# ============================================================================
 def require_admin(request: Request) -> dict:
     token = request.cookies.get("admin_session")
     if token:
@@ -469,6 +489,9 @@ def require_admin_csrf(request: Request, csrf_token: str = Form(...)) -> dict:
         raise HTTPException(status_code=403, detail="Token CSRF invalido.")
     return session
 
+# ============================================================================
+# ROTAS DO PAINEL ADMIN
+# ============================================================================
 @app.get("/admin/login", response_class=HTMLResponse)
 def login_form(): return render_login_page()
 
@@ -711,6 +734,32 @@ def api_revoke_key(key: str, request: Request, _=Depends(require_admin_api)):
     conn.close()
     return {"license_key": key, "revoked": True}
 
+# ============================================================================
+# NOVO ENDPOINT: Resetar todo o banco de dados
+# ============================================================================
+@app.post("/admin/api/reset-all")
+def api_reset_all(request: Request, _=Depends(require_admin_api)):
+    """Apaga todas as licenças, chaves, logs e rate limits do banco de dados."""
+    conn = get_db()
+    _ensure_core_tables(conn)
+    try:
+        conn.execute("DELETE FROM licenses")
+        conn.execute("DELETE FROM license_keys")
+        conn.execute("DELETE FROM admin_audit_log")
+        conn.execute("DELETE FROM rate_limit_events")
+        conn.commit()
+        log_admin_action(conn, request, "reset_all", detail="Todas as tabelas limpas via API", success=True)
+        return {"status": "ok", "message": "Banco de dados limpo com sucesso."}
+    except Exception as e:
+        conn.rollback()
+        log_admin_action(conn, request, "reset_all", detail=f"Erro: {e}", success=False)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+# ============================================================================
+# ROOT
+# ============================================================================
 @app.api_route("/", methods=["GET", "HEAD"])
 def root():
     return {"service": "EADMT4-PRO License Server", "status": "ok", "trial_days": TRIAL_DAYS}
