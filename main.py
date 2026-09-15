@@ -203,12 +203,12 @@ def check_license(request: Request, payload: CheckRequest):
     if _is_rate_limited(conn, "check", _client_ip(request), CHECK_MAX_REQUESTS):
         conn.close()
         return {"status": "error", "expires_at": None, "days_left": 0, "sig": "", "timestamp": None}
-    
+
     now = now_utc()
     key = (payload.license_key or "").strip().upper()
     key_row = None
     key_error = None
-    
+
     if key:
         key_row = row_to_dict(conn.execute("SELECT * FROM license_keys WHERE license_key = ?", (key,)).fetchone(), KEY_COLUMNS)
         if key_row is None: key_error = "key_invalid"
@@ -216,36 +216,36 @@ def check_license(request: Request, payload: CheckRequest):
         else:
             kexp = parse_dt(key_row["expires"])
             if kexp and kexp <= now: key_error = "key_expired"
-    
+
     row = row_to_dict(conn.execute("SELECT * FROM licenses WHERE machine_id = ?", (payload.machine_id,)).fetchone(), LICENSE_COLUMNS)
-    
+
     if key and key_error:
         conn.close()
         return signed_response(key_error, payload.machine_id)
-    
+
     if key and key_row:
         kexp = parse_dt(key_row["expires"])
         if kexp is None:
             kexp = now + timedelta(days=LICENSE_DAYS)
             conn.execute("UPDATE license_keys SET expires = ? WHERE license_key = ?", (kexp.isoformat(), key))
-        
+
         if row is None:
             count = conn.execute("SELECT COUNT(*) FROM licenses WHERE license_key = ? AND revoked = 0", (key,)).fetchone()[0]
             if count >= int(key_row["max_machines"] or MAX_MACHINES_PER_KEY):
                 conn.commit(); conn.close()
                 return signed_response("limit", payload.machine_id)
-            
+
             # ✅ REMOVIDO: trial_expires - apenas license_expires
             conn.execute("INSERT INTO licenses (machine_id, machine_name, first_seen, license_expires, last_seen, license_key, hardware_fingerprint) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (payload.machine_id, payload.machine_name, now.isoformat(), kexp.isoformat(), now.isoformat(), key, payload.hardware_fingerprint))
             conn.commit(); conn.close()
             return signed_response("licensed", payload.machine_id, kexp, max(0, (kexp - now).days))
-        
+
         conn.execute("UPDATE licenses SET last_seen = ?, machine_name = ?, license_key = ?, license_expires = ?, revoked = 0, hardware_fingerprint = COALESCE(NULLIF(?, ''), hardware_fingerprint) WHERE machine_id = ?",
             (now.isoformat(), payload.machine_name or row["machine_name"], key, kexp.isoformat(), payload.hardware_fingerprint, payload.machine_id))
         conn.commit(); conn.close()
         return signed_response("licensed", payload.machine_id, kexp, max(0, (kexp - now).days))
-    
+
     # ✅ SEM TRIAL: se não tem licença, retorna erro
     conn.close()
     return signed_response("error", payload.machine_id)
@@ -308,12 +308,12 @@ def render_dashboard_page(items: list, csrf_token: str) -> str:
     rows_html = ""
     if not items:
         rows_html = '<tr><td colspan="7" style="color:#777;">Nenhuma licença registrada ainda.</td></tr>'
-    
+
     for it in items:
         toggle_label = "Revogar" if it["status_class"] != "revogado" else "Reativar"
         toggle_class = "btn-danger" if it["status_class"] != "revogado" else "btn-ok"
         hw_badge = '<span class="tag suspeito" title="Este fingerprint de hardware aparece em outro machine_id tambem">⚠ dup.</span>' if it["hw_suspect"] else ""
-        
+
         rows_html += f"""
 <tr>
 <td class="mono">{escape(it['machine_id'])}</td>
@@ -331,7 +331,7 @@ def render_dashboard_page(items: list, csrf_token: str) -> str:
 </form>
 </td>
 </tr>"""
-    
+
     return f"""<!DOCTYPE html>
 <html lang="pt-br"><head><meta charset="utf-8"><title>EADMT4-PRO - Dashboard</title>{_PAGE_STYLE}</head>
 <body>
@@ -360,13 +360,13 @@ def render_keys_page(keys: list, csrf_token: str, message: str = "") -> str:
     rows_html = ""
     if not keys:
         rows_html = '<tr><td colspan="5" style="color:#777;">Nenhuma chave gerada ainda.</td></tr>'
-    
+
     for k in keys:
         status = "revogada" if k["revoked"] else "ativa"
         tag_class = "revogado" if k["revoked"] else "licenciado"
         toggle_label = "Revogar" if not k["revoked"] else "Reativar"
         toggle_class = "btn-danger" if not k["revoked"] else "btn-ok"
-        
+
         rows_html += f"""
 <tr>
 <td class="mono">{escape(k['license_key'])}</td>
@@ -381,7 +381,7 @@ def render_keys_page(keys: list, csrf_token: str, message: str = "") -> str:
 </form>
 </td>
 </tr>"""
-    
+
     return f"""<!DOCTYPE html>
 <html lang="pt-br"><head><meta charset="utf-8"><title>EADMT4-PRO - Chaves</title>{_PAGE_STYLE}</head>
 <body>
@@ -397,6 +397,8 @@ def render_keys_page(keys: list, csrf_token: str, message: str = "") -> str:
 {msg_html}
 <form method="post" action="/admin/keygen" style="margin-bottom:18px;">
 <input type="hidden" name="csrf_token" value="{escape(csrf_token)}">
+<label style="display:block; font-size:12.5px; color:#9aa5b5; margin-bottom:6px;">Validade (dias, deixe vazio para sem prazo fixo)</label>
+<input type="number" name="days" min="1" placeholder="Ex.: 3" style="max-width:160px; display:inline-block;">
 <button type="submit" class="btn-ok">+ Gerar nova chave</button>
 </form>
 <table>
@@ -467,39 +469,39 @@ def dashboard(session=Depends(require_admin)):
     rows = conn.execute("SELECT * FROM licenses ORDER BY last_seen DESC").fetchall()
     conn.close()
     now = now_utc()
-    
+
     fingerprint_counts = {}
     for r_raw in rows:
         r = row_to_dict(r_raw, LICENSE_COLUMNS)
         fp = (r.get("hardware_fingerprint") or "").strip()
         if fp:
             fingerprint_counts[fp] = fingerprint_counts.get(fp, 0) + 1
-    
+
     items = []
     for r_raw in rows:
         r = row_to_dict(r_raw, LICENSE_COLUMNS)
         license_expires = parse_dt(r["license_expires"])
-        
-        if r["revoked"]: 
+
+        if r["revoked"]:
             status, status_class = "revogado", "revogado"
-        elif license_expires and license_expires > now: 
+        elif license_expires and license_expires > now:
             status, status_class = "licenciado", "licenciado"
-        else: 
+        else:
             status, status_class = "expirado", "expirado"
-        
+
         fp = (r.get("hardware_fingerprint") or "").strip()
         items.append({
-            "machine_id": r["machine_id"], 
+            "machine_id": r["machine_id"],
             "machine_name": r["machine_name"] or "(sem nome)",
-            "license_key": r["license_key"] or "-", 
+            "license_key": r["license_key"] or "-",
             "last_seen": (r["last_seen"] or "")[:16].replace("T", " "),
-            "status": status, 
+            "status": status,
             "status_class": status_class,
             "license_expires": license_expires.strftime("%d/%m/%Y %H:%M") if license_expires else "-",
             "hw_fingerprint": fp[:12] + "…" if fp else "-",
             "hw_suspect": fingerprint_counts.get(fp, 0) >= 2,
         })
-    
+
     return HTMLResponse(render_dashboard_page(items, session.get("csrf", "")))
 
 @app.post("/admin/license/toggle-revoke")
@@ -527,7 +529,7 @@ def list_keys(nova: str = "", session=Depends(require_admin)):
     return HTMLResponse(render_keys_page(keys, session.get("csrf", ""), message=message))
 
 @app.post("/admin/keygen")
-def keygen(request: Request, session=Depends(require_admin_csrf)):
+def keygen(request: Request, days: Optional[int] = Form(None), session=Depends(require_admin_csrf)):
     conn = get_db()
     _ensure_core_tables(conn)
     new_key = generate_key()
@@ -536,12 +538,17 @@ def keygen(request: Request, session=Depends(require_admin_csrf)):
         if not exists:
             break
         new_key = generate_key()
+
+    expires_iso = None
+    if days and days > 0:
+        expires_iso = (now_utc() + timedelta(days=days)).isoformat()
+
     conn.execute(
         "INSERT INTO license_keys (license_key, created, expires, revoked, max_machines) VALUES (?, ?, ?, 0, ?)",
-        (new_key, now_utc().isoformat(), None, MAX_MACHINES_PER_KEY),
+        (new_key, now_utc().isoformat(), expires_iso, MAX_MACHINES_PER_KEY),
     )
     conn.commit()
-    log_admin_action(conn, request, "gerar_chave", detail=new_key, success=True)
+    log_admin_action(conn, request, "gerar_chave", detail=f"{new_key} ({days or 'sem prazo'}d)", success=True)
     conn.close()
     return RedirectResponse(url=f"/admin/keys?nova={new_key}", status_code=303)
 
@@ -583,8 +590,12 @@ def api_list_keys(_=Depends(require_admin_api)):
     conn.close()
     return {"keys": [row_to_dict(r, KEY_COLUMNS) for r in rows]}
 
+class KeygenRequest(BaseModel):
+    days: Optional[int] = None
+    max_machines: Optional[int] = None
+
 @app.post("/admin/api/keygen")
-def api_keygen(request: Request, _=Depends(require_admin_api)):
+def api_keygen(request: Request, body: KeygenRequest = KeygenRequest(), _=Depends(require_admin_api)):
     conn = get_db()
     _ensure_core_tables(conn)
     new_key = generate_key()
@@ -593,14 +604,21 @@ def api_keygen(request: Request, _=Depends(require_admin_api)):
         if not exists:
             break
         new_key = generate_key()
+
+    expires_iso = None
+    if body.days and body.days > 0:
+        expires_iso = (now_utc() + timedelta(days=body.days)).isoformat()
+
+    max_machines = body.max_machines if (body.max_machines and body.max_machines > 0) else MAX_MACHINES_PER_KEY
+
     conn.execute(
         "INSERT INTO license_keys (license_key, created, expires, revoked, max_machines) VALUES (?, ?, ?, 0, ?)",
-        (new_key, now_utc().isoformat(), None, MAX_MACHINES_PER_KEY),
+        (new_key, now_utc().isoformat(), expires_iso, max_machines),
     )
     conn.commit()
-    log_admin_action(conn, request, "gerar_chave_api", detail=new_key, success=True)
+    log_admin_action(conn, request, "gerar_chave_api", detail=f"{new_key} ({body.days or 'sem prazo'}d, max_machines={max_machines})", success=True)
     conn.close()
-    return {"license_key": new_key, "created": now_utc().isoformat(), "max_machines": MAX_MACHINES_PER_KEY}
+    return {"license_key": new_key, "created": now_utc().isoformat(), "expires": expires_iso, "max_machines": max_machines}
 
 class RenewKeyRequest(BaseModel):
     dias: Optional[int] = None
