@@ -1,3 +1,10 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+EADMT4-PRO License Server
+VERSÃO v2.1 - 2026-09-15
+Alterações: Trial automático de 3 dias para novos usuários (sem chave).
+"""
 import asyncio
 import hashlib
 import hmac
@@ -32,9 +39,12 @@ HEARTBEAT_SECRET = _require_env("HEARTBEAT_SECRET")
 
 ADMIN_API_TOKEN = os.environ.get("ADMIN_API_TOKEN") or ADMIN_PASSWORD
 
-# ✅ REMOVIDO: TRIAL_DAYS não existe mais
-LICENSE_DAYS = 30
-MAX_MACHINES_PER_KEY = 2
+# ============================================================================
+# CONFIGURAÇÕES DE LICENÇA
+# ============================================================================
+TRIAL_DAYS = 3              # ✅ Trial automático de 3 dias para novos usuários
+LICENSE_DAYS = 30           # Duração padrão da licença paga (30 dias)
+MAX_MACHINES_PER_KEY = 2    # Máximo de máquinas por chave paga
 RATE_LIMIT_WINDOW_SEC = 60
 LOGIN_MAX_ATTEMPTS = 5
 CHECK_MAX_REQUESTS = 30
@@ -123,7 +133,6 @@ async def _on_startup():
     _cleanup_rate_limit_events()
     asyncio.create_task(_rate_limit_cleanup_loop())
 
-# ✅ REMOVIDO: trial_expires da lista de colunas
 LICENSE_COLUMNS = ["machine_id", "machine_name", "first_seen", "license_expires", "last_seen", "revoked", "license_key", "hardware_fingerprint"]
 KEY_COLUMNS = ["license_key", "created", "expires", "revoked", "max_machines"]
 
@@ -135,7 +144,6 @@ def _ensure_hardware_fingerprint_column(conn):
         pass
 
 def _ensure_core_tables(conn):
-    # ✅ REMOVIDO: trial_expires do CREATE TABLE
     conn.execute("""
     CREATE TABLE IF NOT EXISTS licenses (
         machine_id TEXT PRIMARY KEY,
@@ -209,6 +217,7 @@ def check_license(request: Request, payload: CheckRequest):
     key_row = None
     key_error = None
 
+    # Verifica chave informada (se houver)
     if key:
         key_row = row_to_dict(conn.execute("SELECT * FROM license_keys WHERE license_key = ?", (key,)).fetchone(), KEY_COLUMNS)
         if key_row is None: key_error = "key_invalid"
@@ -217,12 +226,19 @@ def check_license(request: Request, payload: CheckRequest):
             kexp = parse_dt(key_row["expires"])
             if kexp and kexp <= now: key_error = "key_expired"
 
+    # Verifica licença já registrada para esta máquina
     row = row_to_dict(conn.execute("SELECT * FROM licenses WHERE machine_id = ?", (payload.machine_id,)).fetchone(), LICENSE_COLUMNS)
 
+    # ========================================================================
+    # CASO 1: Chave inválida/revogada/expirada informada
+    # ========================================================================
     if key and key_error:
         conn.close()
         return signed_response(key_error, payload.machine_id)
 
+    # ========================================================================
+    # CASO 2: Chave válida informada → licença paga
+    # ========================================================================
     if key and key_row:
         kexp = parse_dt(key_row["expires"])
         if kexp is None:
@@ -235,7 +251,6 @@ def check_license(request: Request, payload: CheckRequest):
                 conn.commit(); conn.close()
                 return signed_response("limit", payload.machine_id)
 
-            # ✅ REMOVIDO: trial_expires - apenas license_expires
             conn.execute("INSERT INTO licenses (machine_id, machine_name, first_seen, license_expires, last_seen, license_key, hardware_fingerprint) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (payload.machine_id, payload.machine_name, now.isoformat(), kexp.isoformat(), now.isoformat(), key, payload.hardware_fingerprint))
             conn.commit(); conn.close()
@@ -246,9 +261,38 @@ def check_license(request: Request, payload: CheckRequest):
         conn.commit(); conn.close()
         return signed_response("licensed", payload.machine_id, kexp, max(0, (kexp - now).days))
 
-    # ✅ SEM TRIAL: se não tem licença, retorna erro
+    # ========================================================================
+    # CASO 3: Sem chave → Trial automático de 3 dias
+    # ========================================================================
+    trial_expires = now + timedelta(days=TRIAL_DAYS)
+    
+    if row is None:
+        # Primeira vez: cria registro de trial
+        conn.execute(
+            "INSERT INTO licenses (machine_id, machine_name, first_seen, license_expires, last_seen, revoked, license_key, hardware_fingerprint) VALUES (?, ?, ?, ?, ?, 0, NULL, ?)",
+            (payload.machine_id, payload.machine_name, now.isoformat(), trial_expires.isoformat(), now.isoformat(), payload.hardware_fingerprint)
+        )
+        conn.commit()
+        conn.close()
+        print(f"[TRIAL] Novo trial de {TRIAL_DAYS} dias para machine_id={payload.machine_id[:16]}...")
+        return signed_response("trial", payload.machine_id, trial_expires, TRIAL_DAYS)
+    
+    # Já tem registro: verifica se ainda está no período de trial
+    existing_expires = parse_dt(row["license_expires"])
+    if existing_expires and existing_expires > now and not row["license_key"]:
+        # Ainda em trial válido
+        days_left = max(0, (existing_expires - now).days)
+        conn.execute("UPDATE licenses SET last_seen = ?, machine_name = ?, hardware_fingerprint = COALESCE(NULLIF(?, ''), hardware_fingerprint) WHERE machine_id = ?",
+            (now.isoformat(), payload.machine_name or row["machine_name"], payload.hardware_fingerprint, payload.machine_id))
+        conn.commit()
+        conn.close()
+        return signed_response("trial", payload.machine_id, existing_expires, days_left)
+    
+    # Trial expirado (sem chave paga)
+    conn.execute("UPDATE licenses SET last_seen = ? WHERE machine_id = ?", (now.isoformat(), payload.machine_id))
+    conn.commit()
     conn.close()
-    return signed_response("error", payload.machine_id)
+    return signed_response("trial_expired", payload.machine_id)
 
 # ============================================================================
 # RENDERIZAÇÃO HTML DO PAINEL ADMIN
@@ -276,6 +320,7 @@ th, td { text-align:left; padding:8px 10px; border-bottom:1px solid #2c3646; }
 th { color:#9aa5b5; font-weight:600; text-transform:uppercase; font-size:11px; }
 .tag { padding:3px 8px; border-radius:20px; font-size:11.5px; font-weight:600; }
 .tag.licenciado { background:#1c3a2a; color:#5fd68c; }
+.tag.trial { background:#1a3a5c; color:#5fb8ff; }
 .tag.revogado { background:#3a1f24; color:#ff9b9b; }
 .tag.expirado { background:#33291d; color:#e8a15f; }
 .topbar { display:flex; justify-content:space-between; align-items:center; margin-bottom:18px; }
@@ -398,7 +443,7 @@ def render_keys_page(keys: list, csrf_token: str, message: str = "") -> str:
 <form method="post" action="/admin/keygen" style="margin-bottom:18px;">
 <input type="hidden" name="csrf_token" value="{escape(csrf_token)}">
 <label style="display:block; font-size:12.5px; color:#9aa5b5; margin-bottom:6px;">Validade (dias, deixe vazio para sem prazo fixo)</label>
-<input type="number" name="days" min="1" placeholder="Ex.: 3" style="max-width:160px; display:inline-block;">
+<input type="number" name="days" min="1" placeholder="Ex.: 30" style="max-width:160px; display:inline-block;">
 <button type="submit" class="btn-ok">+ Gerar nova chave</button>
 </form>
 <table>
@@ -484,6 +529,12 @@ def dashboard(session=Depends(require_admin)):
 
         if r["revoked"]:
             status, status_class = "revogado", "revogado"
+        elif not r.get("license_key"):
+            # Trial (sem chave paga)
+            if license_expires and license_expires > now:
+                status, status_class = "trial", "trial"
+            else:
+                status, status_class = "expirado", "expirado"
         elif license_expires and license_expires > now:
             status, status_class = "licenciado", "licenciado"
         else:
@@ -493,7 +544,7 @@ def dashboard(session=Depends(require_admin)):
         items.append({
             "machine_id": r["machine_id"],
             "machine_name": r["machine_name"] or "(sem nome)",
-            "license_key": r["license_key"] or "-",
+            "license_key": r["license_key"] or "(trial)",
             "last_seen": (r["last_seen"] or "")[:16].replace("T", " "),
             "status": status,
             "status_class": status_class,
@@ -662,4 +713,4 @@ def api_revoke_key(key: str, request: Request, _=Depends(require_admin_api)):
 
 @app.api_route("/", methods=["GET", "HEAD"])
 def root():
-    return {"service": "EADMT4-PRO License Server", "status": "ok"}
+    return {"service": "EADMT4-PRO License Server", "status": "ok", "trial_days": TRIAL_DAYS}
