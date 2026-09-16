@@ -254,8 +254,8 @@ def check_license(request: Request, payload: CheckRequest):
                 conn.commit(); conn.close()
                 return signed_response("limit", payload.machine_id)
 
-            conn.execute("INSERT INTO licenses (machine_id, machine_name, first_seen, license_expires, last_seen, license_key, hardware_fingerprint) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (payload.machine_id, payload.machine_name, now.isoformat(), kexp.isoformat(), now.isoformat(), key, payload.hardware_fingerprint))
+            conn.execute("INSERT INTO licenses (machine_id, machine_name, first_seen, license_expires, last_seen, license_key, hardware_fingerprint, trial_expires) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (payload.machine_id, payload.machine_name, now.isoformat(), kexp.isoformat(), now.isoformat(), key, payload.hardware_fingerprint, kexp.isoformat()))
             conn.commit(); conn.close()
             return signed_response("licensed", payload.machine_id, kexp, max(0, (kexp - now).days))
 
@@ -269,8 +269,8 @@ def check_license(request: Request, payload: CheckRequest):
     
     if row is None:
         conn.execute(
-            "INSERT INTO licenses (machine_id, machine_name, first_seen, license_expires, last_seen, revoked, license_key, hardware_fingerprint) VALUES (?, ?, ?, ?, ?, 0, NULL, ?)",
-            (payload.machine_id, payload.machine_name, now.isoformat(), trial_expires.isoformat(), now.isoformat(), payload.hardware_fingerprint)
+            "INSERT INTO licenses (machine_id, machine_name, first_seen, license_expires, last_seen, revoked, license_key, hardware_fingerprint, trial_expires) VALUES (?, ?, ?, ?, ?, 0, NULL, ?, ?)",
+            (payload.machine_id, payload.machine_name, now.isoformat(), trial_expires.isoformat(), now.isoformat(), payload.hardware_fingerprint, trial_expires.isoformat())
         )
         conn.commit()
         conn.close()
