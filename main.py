@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-EADMT4-PRO License Server
-VERSÃO v2.2 - 2026-09-16
-- Trial automático de 3 dias para novos usuários
-- Endpoint /admin/api/reset-all para limpar o banco
-- Painel admin com distinção entre trial/licenciado
+EADMT4-PRO License Server v2.3
+Otimizado para free tier do Turso:
+- Rate-limit em memória (sem escritas no banco)
+- Trial automático de 3 dias
+- Endpoint /admin/api/reset-all para limpar banco
 """
 import asyncio
 import hashlib
@@ -17,22 +17,19 @@ import time
 import libsql
 from datetime import datetime, timedelta, timezone
 from html import escape
-from typing import Optional
+from typing import Optional, Dict, List
 from fastapi import FastAPI, Request, Form, HTTPException, Depends
 from fastapi.responses import HTMLResponse, RedirectResponse
 from itsdangerous import URLSafeSerializer, BadSignature
 from pydantic import BaseModel, Field
 
 # ============================================================================
-# CONFIGURAÇÕES - Variáveis de ambiente obrigatórias no Render
+# CONFIGURAÇÕES
 # ============================================================================
 def _require_env(name: str) -> str:
     value = os.environ.get(name)
     if not value:
-        raise RuntimeError(
-            f"Variável de ambiente obrigatória '{name}' não definida. "
-            f"Configure-a no ambiente (ex.: Render > Environment) antes de iniciar o servidor."
-        )
+        raise RuntimeError(f"Variável de ambiente obrigatória '{name}' não definida.")
     return value
 
 TURSO_DATABASE_URL = _require_env("TURSO_DATABASE_URL")
@@ -43,15 +40,50 @@ HEARTBEAT_SECRET = _require_env("HEARTBEAT_SECRET")
 
 ADMIN_API_TOKEN = os.environ.get("ADMIN_API_TOKEN") or ADMIN_PASSWORD
 
-# ============================================================================
-# CONFIGURAÇÕES DE LICENÇA
-# ============================================================================
-TRIAL_DAYS = 3              # Trial automático de 3 dias para novos usuários
-LICENSE_DAYS = 30           # Duração padrão da licença paga (30 dias)
-MAX_MACHINES_PER_KEY = 2    # Máximo de máquinas por chave paga
-RATE_LIMIT_WINDOW_SEC = 60
+TRIAL_DAYS = 3
+LICENSE_DAYS = 30
+MAX_MACHINES_PER_KEY = 2
 LOGIN_MAX_ATTEMPTS = 5
 CHECK_MAX_REQUESTS = 30
+RATE_LIMIT_WINDOW_SEC = 60
+
+# ============================================================================
+# RATE-LIMIT EM MEMÓRIA (sem escritas no banco)
+# ============================================================================
+class InMemoryRateLimiter:
+    """Rate-limit baseado em memória, sem tocar no banco de dados."""
+    
+    def __init__(self):
+        self.requests: Dict[str, List[int]] = {}
+    
+    def is_limited(self, bucket: str, key: str, max_requests: int, window: int = RATE_LIMIT_WINDOW_SEC) -> bool:
+        now = int(time.time())
+        cutoff = now - window
+        composite_key = f"{bucket}:{key}"
+        
+        if composite_key in self.requests:
+            self.requests[composite_key] = [ts for ts in self.requests[composite_key] if ts > cutoff]
+        
+        if len(self.requests.get(composite_key, [])) >= max_requests:
+            return True
+        
+        if composite_key not in self.requests:
+            self.requests[composite_key] = []
+        self.requests[composite_key].append(now)
+        return False
+    
+    def cleanup(self):
+        now = int(time.time())
+        cutoff = now - RATE_LIMIT_WINDOW_SEC
+        keys_to_remove = []
+        for key, timestamps in self.requests.items():
+            self.requests[key] = [ts for ts in timestamps if ts > cutoff]
+            if not self.requests[key]:
+                keys_to_remove.append(key)
+        for key in keys_to_remove:
+            del self.requests[key]
+
+rate_limiter = InMemoryRateLimiter()
 
 # ============================================================================
 # UTILITÁRIOS
@@ -63,49 +95,6 @@ def _client_ip(request: Request) -> str:
         if first_ip:
             return first_ip
     return request.client.host if request.client else "unknown"
-
-def _ensure_rate_limit_table(conn):
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS rate_limit_events (bucket TEXT NOT NULL, key TEXT NOT NULL, ts INTEGER NOT NULL)"
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_rate_limit_bucket_key ON rate_limit_events (bucket, key)"
-    )
-
-def _is_rate_limited(conn, bucket: str, key: str, max_requests: int, window: int = RATE_LIMIT_WINDOW_SEC) -> bool:
-    _ensure_rate_limit_table(conn)
-    now = int(time.time())
-    cutoff = now - window
-    conn.execute("DELETE FROM rate_limit_events WHERE bucket = ? AND ts < ?", (bucket, cutoff))
-    count = conn.execute(
-        "SELECT COUNT(*) FROM rate_limit_events WHERE bucket = ? AND key = ?", (bucket, key)
-    ).fetchone()[0]
-    if count >= max_requests:
-        conn.commit()
-        return True
-    conn.execute("INSERT INTO rate_limit_events (bucket, key, ts) VALUES (?, ?, ?)", (bucket, key, now))
-    conn.commit()
-    return False
-
-RATE_LIMIT_CLEANUP_INTERVAL_SEC = 6 * 60 * 60
-RATE_LIMIT_RETENTION_SEC = 24 * 60 * 60
-
-def _cleanup_rate_limit_events():
-    try:
-        conn = get_db()
-        _ensure_rate_limit_table(conn)
-        cutoff = int(time.time()) - RATE_LIMIT_RETENTION_SEC
-        conn.execute("DELETE FROM rate_limit_events WHERE ts < ?", (cutoff,))
-        conn.commit()
-        conn.close()
-        print(f"[CLEANUP] rate_limit_events: linhas com ts < {cutoff} removidas.")
-    except Exception as e:
-        print(f"[CLEANUP ERROR] {e}")
-
-async def _rate_limit_cleanup_loop():
-    while True:
-        await asyncio.sleep(RATE_LIMIT_CLEANUP_INTERVAL_SEC)
-        _cleanup_rate_limit_events()
 
 def _ensure_audit_log_table(conn):
     conn.execute(
@@ -140,8 +129,12 @@ async def _security_headers_middleware(request: Request, call_next):
 
 @app.on_event("startup")
 async def _on_startup():
-    _cleanup_rate_limit_events()
-    asyncio.create_task(_rate_limit_cleanup_loop())
+    async def cleanup_loop():
+        while True:
+            await asyncio.sleep(6 * 60 * 60)
+            rate_limiter.cleanup()
+            print("[CLEANUP] Rate-limit em memória limpo.")
+    asyncio.create_task(cleanup_loop())
 
 # ============================================================================
 # BANCO DE DADOS
@@ -222,18 +215,17 @@ class CheckRequest(BaseModel):
 
 @app.post("/api/check")
 def check_license(request: Request, payload: CheckRequest):
-    conn = get_db()
-    _ensure_core_tables(conn)
-    if _is_rate_limited(conn, "check", _client_ip(request), CHECK_MAX_REQUESTS):
-        conn.close()
+    # ✅ RATE-LIMIT EM MEMÓRIA (sem escritas no banco)
+    if rate_limiter.is_limited("check", _client_ip(request), CHECK_MAX_REQUESTS):
         return {"status": "error", "expires_at": None, "days_left": 0, "sig": "", "timestamp": None}
 
+    conn = get_db()
+    _ensure_core_tables(conn)
     now = now_utc()
     key = (payload.license_key or "").strip().upper()
     key_row = None
     key_error = None
 
-    # Verifica chave informada (se houver)
     if key:
         key_row = row_to_dict(conn.execute("SELECT * FROM license_keys WHERE license_key = ?", (key,)).fetchone(), KEY_COLUMNS)
         if key_row is None: key_error = "key_invalid"
@@ -242,19 +234,14 @@ def check_license(request: Request, payload: CheckRequest):
             kexp = parse_dt(key_row["expires"])
             if kexp and kexp <= now: key_error = "key_expired"
 
-    # Verifica licença já registrada para esta máquina
     row = row_to_dict(conn.execute("SELECT * FROM licenses WHERE machine_id = ?", (payload.machine_id,)).fetchone(), LICENSE_COLUMNS)
 
-    # ========================================================================
-    # CASO 1: Chave inválida/revogada/expirada informada
-    # ========================================================================
+    # Chave inválida
     if key and key_error:
         conn.close()
         return signed_response(key_error, payload.machine_id)
 
-    # ========================================================================
-    # CASO 2: Chave válida informada → licença paga
-    # ========================================================================
+    # Chave válida - licença paga
     if key and key_row:
         kexp = parse_dt(key_row["expires"])
         if kexp is None:
@@ -277,13 +264,10 @@ def check_license(request: Request, payload: CheckRequest):
         conn.commit(); conn.close()
         return signed_response("licensed", payload.machine_id, kexp, max(0, (kexp - now).days))
 
-    # ========================================================================
-    # CASO 3: Sem chave → Trial automático de 3 dias
-    # ========================================================================
+    # ✅ TRIAL AUTOMÁTICO DE 3 DIAS
     trial_expires = now + timedelta(days=TRIAL_DAYS)
     
     if row is None:
-        # Primeira vez: cria registro de trial
         conn.execute(
             "INSERT INTO licenses (machine_id, machine_name, first_seen, license_expires, last_seen, revoked, license_key, hardware_fingerprint) VALUES (?, ?, ?, ?, ?, 0, NULL, ?)",
             (payload.machine_id, payload.machine_name, now.isoformat(), trial_expires.isoformat(), now.isoformat(), payload.hardware_fingerprint)
@@ -293,10 +277,8 @@ def check_license(request: Request, payload: CheckRequest):
         print(f"[TRIAL] Novo trial de {TRIAL_DAYS} dias para machine_id={payload.machine_id[:16]}...")
         return signed_response("trial", payload.machine_id, trial_expires, TRIAL_DAYS)
     
-    # Já tem registro: verifica se ainda está no período de trial
     existing_expires = parse_dt(row["license_expires"])
     if existing_expires and existing_expires > now and not row["license_key"]:
-        # Ainda em trial válido
         days_left = max(0, (existing_expires - now).days)
         conn.execute("UPDATE licenses SET last_seen = ?, machine_name = ?, hardware_fingerprint = COALESCE(NULLIF(?, ''), hardware_fingerprint) WHERE machine_id = ?",
             (now.isoformat(), payload.machine_name or row["machine_name"], payload.hardware_fingerprint, payload.machine_id))
@@ -304,14 +286,13 @@ def check_license(request: Request, payload: CheckRequest):
         conn.close()
         return signed_response("trial", payload.machine_id, existing_expires, days_left)
     
-    # Trial expirado (sem chave paga)
     conn.execute("UPDATE licenses SET last_seen = ? WHERE machine_id = ?", (now.isoformat(), payload.machine_id))
     conn.commit()
     conn.close()
     return signed_response("trial_expired", payload.machine_id)
 
 # ============================================================================
-# RENDERIZAÇÃO HTML DO PAINEL ADMIN
+# ESTILO CSS DO PAINEL ADMIN
 # ============================================================================
 _PAGE_STYLE = """
 <style>
@@ -349,6 +330,9 @@ form.inline { display:inline; }
 </style>
 """
 
+# ============================================================================
+# RENDERIZAÇÃO HTML DO PAINEL ADMIN
+# ============================================================================
 def render_login_page(error: str = "") -> str:
     err_html = f'<div class="err">{escape(error)}</div>' if error else ""
     return f"""<!DOCTYPE html>
@@ -498,7 +482,7 @@ def login_form(): return render_login_page()
 @app.post("/admin/login")
 def login(request: Request, password: str = Form(...)):
     conn = get_db()
-    limited = _is_rate_limited(conn, "login", _client_ip(request), LOGIN_MAX_ATTEMPTS)
+    limited = rate_limiter.is_limited("login", _client_ip(request), LOGIN_MAX_ATTEMPTS)
     if limited:
         log_admin_action(conn, request, "login", detail="rate_limited", success=False)
         conn.close()
@@ -553,7 +537,6 @@ def dashboard(session=Depends(require_admin)):
         if r["revoked"]:
             status, status_class = "revogado", "revogado"
         elif not r.get("license_key"):
-            # Trial (sem chave paga)
             if license_expires and license_expires > now:
                 status, status_class = "trial", "trial"
             else:
@@ -645,7 +628,7 @@ def toggle_key_revoke(request: Request, license_key: str = Form(...), session=De
 # ============================================================================
 def require_admin_api(request: Request) -> None:
     conn = get_db()
-    if _is_rate_limited(conn, "admin_api", _client_ip(request), LOGIN_MAX_ATTEMPTS):
+    if rate_limiter.is_limited("admin_api", _client_ip(request), LOGIN_MAX_ATTEMPTS):
         log_admin_action(conn, request, "admin_api", detail="rate_limited", success=False)
         conn.close()
         raise HTTPException(status_code=429, detail="Muitas tentativas. Aguarde um minuto.")
@@ -735,7 +718,7 @@ def api_revoke_key(key: str, request: Request, _=Depends(require_admin_api)):
     return {"license_key": key, "revoked": True}
 
 # ============================================================================
-# NOVO ENDPOINT: Resetar todo o banco de dados
+# ENDPOINT: RESETAR TODO O BANCO (para tutoriais/testes)
 # ============================================================================
 @app.post("/admin/api/reset-all")
 def api_reset_all(request: Request, _=Depends(require_admin_api)):
@@ -746,7 +729,6 @@ def api_reset_all(request: Request, _=Depends(require_admin_api)):
         conn.execute("DELETE FROM licenses")
         conn.execute("DELETE FROM license_keys")
         conn.execute("DELETE FROM admin_audit_log")
-        conn.execute("DELETE FROM rate_limit_events")
         conn.commit()
         log_admin_action(conn, request, "reset_all", detail="Todas as tabelas limpas via API", success=True)
         return {"status": "ok", "message": "Banco de dados limpo com sucesso."}
