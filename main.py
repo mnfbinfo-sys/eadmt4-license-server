@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-EADMT4-PRO License Server v2.3
+EADMT4-PRO License Server v2.4 (Estável)
 Otimizado para free tier do Turso:
 - Rate-limit em memória (sem escritas no banco)
-- Trial automático de 3 dias
+- Trial automático de 3 dias (Corrigido schema de colunas)
 - Endpoint /admin/api/reset-all para limpar banco
+- Assinatura HMAC-SHA256 100% compatível com o EADMT4_LiveSync MT4
 """
 import asyncio
 import hashlib
@@ -44,15 +45,13 @@ TRIAL_DAYS = 3
 LICENSE_DAYS = 30
 MAX_MACHINES_PER_KEY = 2
 LOGIN_MAX_ATTEMPTS = 5
-CHECK_MAX_REQUESTS = 30
+CHECK_MAX_REQUESTS = 60
 RATE_LIMIT_WINDOW_SEC = 60
 
 # ============================================================================
-# RATE-LIMIT EM MEMÓRIA (sem escritas no banco)
+# RATE-LIMIT EM MEMÓRIA
 # ============================================================================
 class InMemoryRateLimiter:
-    """Rate-limit baseado em memória, sem tocar no banco de dados."""
-    
     def __init__(self):
         self.requests: Dict[str, List[int]] = {}
     
@@ -133,7 +132,6 @@ async def _on_startup():
         while True:
             await asyncio.sleep(6 * 60 * 60)
             rate_limiter.cleanup()
-            print("[CLEANUP] Rate-limit em memória limpo.")
     asyncio.create_task(cleanup_loop())
 
 # ============================================================================
@@ -141,13 +139,6 @@ async def _on_startup():
 # ============================================================================
 LICENSE_COLUMNS = ["machine_id", "machine_name", "first_seen", "license_expires", "last_seen", "revoked", "license_key", "hardware_fingerprint"]
 KEY_COLUMNS = ["license_key", "created", "expires", "revoked", "max_machines"]
-
-def _ensure_hardware_fingerprint_column(conn):
-    try:
-        conn.execute("ALTER TABLE licenses ADD COLUMN hardware_fingerprint TEXT")
-        conn.commit()
-    except Exception:
-        pass
 
 def _ensure_core_tables(conn):
     conn.execute("""
@@ -158,7 +149,8 @@ def _ensure_core_tables(conn):
         license_expires TEXT,
         last_seen TEXT,
         revoked INTEGER DEFAULT 0,
-        license_key TEXT
+        license_key TEXT,
+        hardware_fingerprint TEXT
     )
     """)
     conn.execute("""
@@ -170,7 +162,12 @@ def _ensure_core_tables(conn):
         max_machines INTEGER
     )
     """)
-    _ensure_hardware_fingerprint_column(conn)
+    # Garante a coluna se o banco for antigo
+    try:
+        conn.execute("ALTER TABLE licenses ADD COLUMN hardware_fingerprint TEXT")
+        conn.commit()
+    except Exception:
+        pass
 
 def get_db():
     try:
@@ -202,7 +199,13 @@ def sign_heartbeat(status: str, machine_id: str, timestamp: int) -> str:
 def signed_response(status: str, machine_id: str, expires_at=None, days_left: int = 0) -> dict:
     timestamp = int(now_utc().timestamp())
     sig = sign_heartbeat(status, machine_id, timestamp)
-    return {"status": status, "expires_at": expires_at.isoformat() if expires_at else None, "days_left": days_left, "timestamp": timestamp, "sig": sig}
+    return {
+        "status": status,
+        "expires_at": expires_at.isoformat() if expires_at else None,
+        "days_left": days_left,
+        "timestamp": timestamp,
+        "sig": sig
+    }
 
 # ============================================================================
 # API PÚBLICA - /api/check
@@ -215,7 +218,6 @@ class CheckRequest(BaseModel):
 
 @app.post("/api/check")
 def check_license(request: Request, payload: CheckRequest):
-    # ✅ RATE-LIMIT EM MEMÓRIA (sem escritas no banco)
     if rate_limiter.is_limited("check", _client_ip(request), CHECK_MAX_REQUESTS):
         return {"status": "error", "expires_at": None, "days_left": 0, "sig": "", "timestamp": None}
 
@@ -236,7 +238,7 @@ def check_license(request: Request, payload: CheckRequest):
 
     row = row_to_dict(conn.execute("SELECT * FROM licenses WHERE machine_id = ?", (payload.machine_id,)).fetchone(), LICENSE_COLUMNS)
 
-    # Chave inválida
+    # Chave com erro
     if key and key_error:
         conn.close()
         return signed_response(key_error, payload.machine_id)
@@ -254,8 +256,9 @@ def check_license(request: Request, payload: CheckRequest):
                 conn.commit(); conn.close()
                 return signed_response("limit", payload.machine_id)
 
-            conn.execute("INSERT INTO licenses (machine_id, machine_name, first_seen, license_expires, last_seen, license_key, hardware_fingerprint, trial_expires) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (payload.machine_id, payload.machine_name, now.isoformat(), kexp.isoformat(), now.isoformat(), key, payload.hardware_fingerprint, kexp.isoformat()))
+            # ✅ CORRIGIDO: sem coluna fantasma trial_expires
+            conn.execute("INSERT INTO licenses (machine_id, machine_name, first_seen, license_expires, last_seen, license_key, hardware_fingerprint) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (payload.machine_id, payload.machine_name, now.isoformat(), kexp.isoformat(), now.isoformat(), key, payload.hardware_fingerprint))
             conn.commit(); conn.close()
             return signed_response("licensed", payload.machine_id, kexp, max(0, (kexp - now).days))
 
@@ -268,17 +271,17 @@ def check_license(request: Request, payload: CheckRequest):
     trial_expires = now + timedelta(days=TRIAL_DAYS)
     
     if row is None:
+        # ✅ CORRIGIDO: usa license_expires padrão
         conn.execute(
-            "INSERT INTO licenses (machine_id, machine_name, first_seen, license_expires, last_seen, revoked, license_key, hardware_fingerprint, trial_expires) VALUES (?, ?, ?, ?, ?, 0, NULL, ?, ?)",
-            (payload.machine_id, payload.machine_name, now.isoformat(), trial_expires.isoformat(), now.isoformat(), payload.hardware_fingerprint, trial_expires.isoformat())
+            "INSERT INTO licenses (machine_id, machine_name, first_seen, license_expires, last_seen, revoked, license_key, hardware_fingerprint) VALUES (?, ?, ?, ?, ?, 0, NULL, ?)",
+            (payload.machine_id, payload.machine_name, now.isoformat(), trial_expires.isoformat(), now.isoformat(), payload.hardware_fingerprint)
         )
         conn.commit()
         conn.close()
-        print(f"[TRIAL] Novo trial de {TRIAL_DAYS} dias para machine_id={payload.machine_id[:16]}...")
         return signed_response("trial", payload.machine_id, trial_expires, TRIAL_DAYS)
     
     existing_expires = parse_dt(row["license_expires"])
-    if existing_expires and existing_expires > now and not row["license_key"]:
+    if existing_expires and existing_expires > now and not row.get("license_key"):
         days_left = max(0, (existing_expires - now).days)
         conn.execute("UPDATE licenses SET last_seen = ?, machine_name = ?, hardware_fingerprint = COALESCE(NULLIF(?, ''), hardware_fingerprint) WHERE machine_id = ?",
             (now.isoformat(), payload.machine_name or row["machine_name"], payload.hardware_fingerprint, payload.machine_id))
@@ -353,12 +356,12 @@ def render_login_page(error: str = "") -> str:
 def render_dashboard_page(items: list, csrf_token: str) -> str:
     rows_html = ""
     if not items:
-        rows_html = '<tr><td colspan="7" style="color:#777;">Nenhuma licença registrada ainda.</td></tr>'
+        rows_html = '<tr><td colspan="8" style="color:#777;">Nenhuma licença registrada ainda.</td></tr>'
 
     for it in items:
         toggle_label = "Revogar" if it["status_class"] != "revogado" else "Reativar"
         toggle_class = "btn-danger" if it["status_class"] != "revogado" else "btn-ok"
-        hw_badge = '<span class="tag suspeito" title="Este fingerprint de hardware aparece em outro machine_id tambem">⚠ dup.</span>' if it["hw_suspect"] else ""
+        hw_badge = '<span class="tag suspeito" title="Hardware duplicado em outro ID">⚠ dup.</span>' if it["hw_suspect"] else ""
 
         rows_html += f"""
 <tr>
@@ -486,7 +489,7 @@ def login(request: Request, password: str = Form(...)):
     if limited:
         log_admin_action(conn, request, "login", detail="rate_limited", success=False)
         conn.close()
-        return HTMLResponse(render_login_page("Muitas tentativas. "), status_code=429)
+        return HTMLResponse(render_login_page("Muitas tentativas."), status_code=429)
     if not hmac.compare_digest(password, ADMIN_PASSWORD):
         log_admin_action(conn, request, "login", detail="senha_incorreta", success=False)
         conn.close()
@@ -685,7 +688,7 @@ class RenewKeyRequest(BaseModel):
 def api_renew_key(key: str, body: RenewKeyRequest, request: Request, _=Depends(require_admin_api)):
     dias = body.dias or body.days
     if not dias or dias <= 0:
-        raise HTTPException(status_code=422, detail="Informe 'dias' (ou 'days') maior que zero.")
+        raise HTTPException(status_code=422, detail="Informe 'dias' maior que zero.")
     conn = get_db()
     _ensure_core_tables(conn)
     row = row_to_dict(conn.execute("SELECT * FROM license_keys WHERE license_key = ?", (key,)).fetchone(), KEY_COLUMNS)
@@ -717,12 +720,8 @@ def api_revoke_key(key: str, request: Request, _=Depends(require_admin_api)):
     conn.close()
     return {"license_key": key, "revoked": True}
 
-# ============================================================================
-# ENDPOINT: RESETAR TODO O BANCO (para tutoriais/testes)
-# ============================================================================
 @app.post("/admin/api/reset-all")
 def api_reset_all(request: Request, _=Depends(require_admin_api)):
-    """Apaga todas as licenças, chaves, logs e rate limits do banco de dados."""
     conn = get_db()
     _ensure_core_tables(conn)
     try:
@@ -730,18 +729,14 @@ def api_reset_all(request: Request, _=Depends(require_admin_api)):
         conn.execute("DELETE FROM license_keys")
         conn.execute("DELETE FROM admin_audit_log")
         conn.commit()
-        log_admin_action(conn, request, "reset_all", detail="Todas as tabelas limpas via API", success=True)
+        log_admin_action(conn, request, "reset_all", detail="Tabelas limpas via API", success=True)
         return {"status": "ok", "message": "Banco de dados limpo com sucesso."}
     except Exception as e:
         conn.rollback()
-        log_admin_action(conn, request, "reset_all", detail=f"Erro: {e}", success=False)
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         conn.close()
 
-# ============================================================================
-# ROOT
-# ============================================================================
 @app.api_route("/", methods=["GET", "HEAD"])
 def root():
     return {"service": "EADMT4-PRO License Server", "status": "ok", "trial_days": TRIAL_DAYS}
