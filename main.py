@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-EADMT4-PRO License Server v2.7 (Correção do Erro 500 / LibSQL)
+EADMT4-PRO License Server v2.8 (Correção Definitiva do CSRF no Keygen + LibSQL Blindado)
 """
 import asyncio
 import hashlib
@@ -99,12 +99,11 @@ async def _on_startup():
             await asyncio.sleep(6 * 60 * 60)
             rate_limiter.cleanup()
     asyncio.create_task(cleanup_loop())
-    # Cria as tabelas na inicialização de forma segura
     try:
         conn = get_db()
         _ensure_core_tables(conn)
         conn.close()
-        print("[DATABASE] Tabelas verificadas com sucesso na inicialização.")
+        print("[DATABASE] Tabelas verificadas na inicialização.")
     except Exception as e:
         print(f"[DATABASE INIT ERROR] {e}")
 
@@ -241,7 +240,7 @@ def check_license(request: Request, payload: CheckRequest):
                 conn.close()
                 return signed_response("licensed", payload.machine_id, kexp, max(0, (kexp - now).days))
 
-        # 2. NOVO CLIENTE -> CRIA TRIAL DE 3 DIAS AUTOMATICO
+        # 2. NOVO CLIENTE -> CRIA TRIAL DE 3 DIAS
         trial_expires = now + timedelta(days=TRIAL_DAYS)
 
         if row is None:
@@ -252,7 +251,6 @@ def check_license(request: Request, payload: CheckRequest):
             try: conn.commit()
             except Exception: pass
             conn.close()
-            print(f"[TRIAL CRIADO COM SUCESSO] {payload.machine_id}")
             return signed_response("trial", payload.machine_id, trial_expires, TRIAL_DAYS)
 
         # 3. MÁQUINA JÁ EXISTE
@@ -282,10 +280,10 @@ def check_license(request: Request, payload: CheckRequest):
     except Exception as e:
         print("[ERRO FATAL NA ROTA /api/check]:")
         traceback.print_exc()
-        return JSONResponse(status_code=500, content={"status": "error", "error": str(e), "trace": traceback.format_exc()})
+        return JSONResponse(status_code=500, content={"status": "error", "error": str(e)})
 
 # ============================================================================
-# INTERFACE DO PAINEL ADMIN
+# ESTILOS E INTERFACE DO PAINEL WEB
 # ============================================================================
 _PAGE_STYLE = """
 <style>
@@ -403,6 +401,7 @@ def render_keys_page(keys: list, csrf_token: str, message: str = "") -> str:
 <div><a href="/admin">👥 Ver Clientes</a><a href="/admin/logout" style="color:#ff3b56;">🚪 Sair</a></div>
 </div>{msg_html}
 <form method="post" action="/admin/keygen" style="display:flex; gap:10px; align-items:center; margin-bottom:20px; background:#090e17; padding:14px; border-radius:8px;">
+<input type="hidden" name="csrf_token" value="{escape(csrf_token)}">
 <span style="font-size:13px; font-weight:600; color:#8e9eb5;">GERAR NOVA CHAVE:</span>
 <input type="number" name="days" min="1" placeholder="Validade em dias (Ex: 30) ou vazio para vitalícia" style="max-width:380px;">
 <button type="submit" class="btn-ok">⚡ Gerar Chave Agora</button>
