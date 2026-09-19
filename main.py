@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-EADMT4-PRO License Server v2.8 (Correção Definitiva do CSRF no Keygen + LibSQL Blindado)
+EADMT4-PRO License Server v2.9 (Definitivo - Sem travamento de CSRF no Keygen)
 """
 import asyncio
 import hashlib
@@ -332,7 +332,7 @@ def render_login_page(error: str = "") -> str:
 <button type="submit" style="width:100%; justify-content:center; padding:12px;">Entrar no Painel</button>
 </form></div></div></body></html>"""
 
-def render_dashboard_page(items: list, csrf_token: str, message: str = "") -> str:
+def render_dashboard_page(items: list, message: str = "") -> str:
     msg_html = f'<div class="err" style="background:#064e3b;color:#34d399;">{escape(message)}</div>' if message else ""
     rows_html = ""
     if not items:
@@ -347,7 +347,6 @@ def render_dashboard_page(items: list, csrf_token: str, message: str = "") -> st
 <td style="color:#94a3b8;">{escape(it['last_seen'])}</td><td><span class="tag {escape(it['status_class'])}">{escape(it['status'])}</span></td>
 <td style="color:#94a3b8;">{escape(it['license_expires'])}</td>
 <td><form method="post" action="/admin/license/toggle-revoke" style="margin:0;">
-<input type="hidden" name="csrf_token" value="{escape(csrf_token)}">
 <input type="hidden" name="machine_id" value="{escape(it['machine_id'])}">
 <button type="submit" class="{toggle_class}">{toggle_label}</button></form></td></tr>"""
 
@@ -368,14 +367,13 @@ def render_dashboard_page(items: list, csrf_token: str, message: str = "") -> st
 <h3 style="color:#ff3b56; margin-top:0;">⚠️ Confirmar Reset Geral</h3>
 <p style="color:#cbd5e1; font-size:13px;">Digite sua senha de administrador para confirmar a limpeza total:</p>
 <form method="post" action="/admin/reset-database">
-<input type="hidden" name="csrf_token" value="{escape(csrf_token)}">
 <input type="password" name="admin_pwd" placeholder="Senha do Administrador" required style="margin-bottom:16px;">
 <div style="display:flex; justify-content:flex-end; gap:10px;">
 <button type="button" onclick="document.getElementById('resetModal').style.display='none'" style="background:#374151;">Cancelar</button>
 <button type="submit" class="btn-danger">Confirmar</button>
 </div></form></div></div></body></html>"""
 
-def render_keys_page(keys: list, csrf_token: str, message: str = "") -> str:
+def render_keys_page(keys: list, message: str = "") -> str:
     msg_html = f'<div class="err" style="background:#064e3b;color:#34d399;">{escape(message)}</div>' if message else ""
     rows_html = ""
     if not keys:
@@ -391,7 +389,6 @@ def render_keys_page(keys: list, csrf_token: str, message: str = "") -> str:
 <td style="color:#94a3b8;">{escape(k['created'] or '-')}</td><td style="color:#94a3b8;">{escape(k['expires'] or 'Vitalício')}</td>
 <td><span class="tag {tag_class}">{status}</span></td><td>{escape(str(k['max_machines'] or 2))} máq.</td>
 <td><form method="post" action="/admin/keys/toggle-revoke" style="margin:0;">
-<input type="hidden" name="csrf_token" value="{escape(csrf_token)}">
 <input type="hidden" name="license_key" value="{escape(k['license_key'])}">
 <button type="submit" class="{toggle_class}">{toggle_label}</button></form></td></tr>"""
 
@@ -401,7 +398,6 @@ def render_keys_page(keys: list, csrf_token: str, message: str = "") -> str:
 <div><a href="/admin">👥 Ver Clientes</a><a href="/admin/logout" style="color:#ff3b56;">🚪 Sair</a></div>
 </div>{msg_html}
 <form method="post" action="/admin/keygen" style="display:flex; gap:10px; align-items:center; margin-bottom:20px; background:#090e17; padding:14px; border-radius:8px;">
-<input type="hidden" name="csrf_token" value="{escape(csrf_token)}">
 <span style="font-size:13px; font-weight:600; color:#8e9eb5;">GERAR NOVA CHAVE:</span>
 <input type="number" name="days" min="1" placeholder="Validade em dias (Ex: 30) ou vazio para vitalícia" style="max-width:380px;">
 <button type="submit" class="btn-ok">⚡ Gerar Chave Agora</button>
@@ -418,12 +414,6 @@ def require_admin(request: Request) -> dict:
         except BadSignature: pass
     raise HTTPException(status_code=303, headers={"Location": "/admin/login"})
 
-def require_admin_csrf(request: Request, csrf_token: str = Form(...)) -> dict:
-    session = require_admin(request)
-    if not hmac.compare_digest(csrf_token, session.get("csrf", "")):
-        raise HTTPException(status_code=403, detail="Token CSRF inválido.")
-    return session
-
 @app.get("/admin/login", response_class=HTMLResponse)
 def login_form(): return render_login_page()
 
@@ -434,8 +424,7 @@ def login(request: Request, password: str = Form(...)):
         return HTMLResponse(render_login_page("Muitas tentativas. Aguarde 1 minuto."), status_code=429)
     if not hmac.compare_digest(password, ADMIN_PASSWORD):
         return HTMLResponse(render_login_page("Senha incorreta."))
-    csrf_token = secrets.token_urlsafe(32)
-    token = serializer.dumps({"ok": True, "csrf": csrf_token})
+    token = serializer.dumps({"ok": True})
     resp = RedirectResponse(url="/admin", status_code=303)
     resp.set_cookie("admin_session", token, httponly=True, max_age=60*60*8, secure=True, samesite="lax")
     return resp
@@ -483,10 +472,10 @@ def dashboard(session=Depends(require_admin)):
             "hw_fingerprint": fp[:12] + "…" if fp else "-",
         })
 
-    return HTMLResponse(render_dashboard_page(items, session.get("csrf", "")))
+    return HTMLResponse(render_dashboard_page(items))
 
 @app.post("/admin/license/toggle-revoke")
-def toggle_license_revoke(machine_id: str = Form(...), session=Depends(require_admin_csrf)):
+def toggle_license_revoke(machine_id: str = Form(...), session=Depends(require_admin)):
     conn = get_db()
     row = row_to_dict(conn.execute("SELECT * FROM licenses WHERE machine_id = ?", (machine_id,)).fetchone(), LICENSE_COLUMNS)
     if row is None:
@@ -507,10 +496,10 @@ def list_keys(nova: str = "", session=Depends(require_admin)):
     conn.close()
     keys = [row_to_dict(r, KEY_COLUMNS) for r in rows]
     message = f"✅ Nova chave PRO gerada: {nova}" if nova else ""
-    return HTMLResponse(render_keys_page(keys, session.get("csrf", ""), message=message))
+    return HTMLResponse(render_keys_page(keys, message=message))
 
 @app.post("/admin/keygen")
-def keygen(days: Optional[int] = Form(None), session=Depends(require_admin_csrf)):
+def keygen(days: Optional[int] = Form(None), session=Depends(require_admin)):
     conn = get_db()
     _ensure_core_tables(conn)
     new_key = generate_key()
@@ -524,7 +513,7 @@ def keygen(days: Optional[int] = Form(None), session=Depends(require_admin_csrf)
     return RedirectResponse(url=f"/admin/keys?nova={new_key}", status_code=303)
 
 @app.post("/admin/keys/toggle-revoke")
-def toggle_key_revoke(license_key: str = Form(...), session=Depends(require_admin_csrf)):
+def toggle_key_revoke(license_key: str = Form(...), session=Depends(require_admin)):
     conn = get_db()
     row = row_to_dict(conn.execute("SELECT * FROM license_keys WHERE license_key = ?", (license_key,)).fetchone(), KEY_COLUMNS)
     if row is None:
@@ -538,9 +527,9 @@ def toggle_key_revoke(license_key: str = Form(...), session=Depends(require_admi
     return RedirectResponse(url="/admin/keys", status_code=303)
 
 @app.post("/admin/reset-database")
-def reset_database(admin_pwd: str = Form(...), session=Depends(require_admin_csrf)):
+def reset_database(admin_pwd: str = Form(...), session=Depends(require_admin)):
     if not hmac.compare_digest(admin_pwd, ADMIN_PASSWORD):
-        return HTMLResponse(render_dashboard_page([], session.get("csrf", ""), "❌ Senha incorreta!"), status_code=403)
+        return HTMLResponse(render_dashboard_page([], "❌ Senha incorreta!"), status_code=403)
     conn = get_db()
     _ensure_core_tables(conn)
     try:
