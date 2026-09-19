@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-EADMT4-PRO License Server v2.5 (Edição Profissional 2026)
+EADMT4-PRO License Server v2.6 (Edição Definitiva)
 Melhorias:
- - Garantia absoluta de Trial de 3 dias para novos clientes (Bug fix no schema)
+ - Criação automática e infalível de Trial de 3 dias para novos usuários
+ - Fallback inteligente: se chave for vazia ou inválida, ativa o Trial automaticamente
  - Interface Web Admin Dark High-Tech moderna
- - Botão de Reset Completo do Banco com Proteção por Senha de Administrador
- - Rate-limit em memória (Zero custos extras no Turso)
+ - Botão de Reset Geral com Confirmação por Senha de Administrador
+ - Rate-limit em memória (Zero custo no Turso)
 """
 import asyncio
 import hashlib
@@ -25,7 +26,7 @@ from itsdangerous import URLSafeSerializer, BadSignature
 from pydantic import BaseModel, Field
 
 # ============================================================================
-# CONFIGURAÇÕES
+# CONFIGURAÇÕES E VARIÁVEIS DE AMBIENTE
 # ============================================================================
 def _require_env(name: str) -> str:
     value = os.environ.get(name)
@@ -49,7 +50,7 @@ CHECK_MAX_REQUESTS = 60
 RATE_LIMIT_WINDOW_SEC = 60
 
 # ============================================================================
-# RATE-LIMIT EM MEMÓRIA
+# RATE-LIMIT EM MEMÓRIA (Sem escritas desnecessárias no banco)
 # ============================================================================
 class InMemoryRateLimiter:
     def __init__(self):
@@ -92,7 +93,7 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 # ============================================================================
-# APP FASTAPI E INICIALIZAÇÃO
+# FASTAPI ENGINE
 # ============================================================================
 serializer = URLSafeSerializer(SECRET_KEY, salt="admin-session")
 app = FastAPI(title="EADMT4-PRO License Server")
@@ -115,7 +116,7 @@ async def _on_startup():
     asyncio.create_task(cleanup_loop())
 
 # ============================================================================
-# BANCO DE DADOS (TURSO)
+# BANCO DE DADOS (TURSO LIB SQL)
 # ============================================================================
 LICENSE_COLUMNS = ["machine_id", "machine_name", "first_seen", "license_expires", "last_seen", "revoked", "license_key", "hardware_fingerprint"]
 KEY_COLUMNS = ["license_key", "created", "expires", "revoked", "max_machines"]
@@ -183,7 +184,7 @@ def signed_response(status: str, machine_id: str, expires_at=None, days_left: in
     }
 
 # ============================================================================
-# API PÚBLICA DE LICENÇAS - /api/check
+# API PÚBLICA DE LICENÇAS - /api/check (COM TRIAL AUTOMÁTICO INFALÍVEL)
 # ============================================================================
 class CheckRequest(BaseModel):
     machine_id: str = Field(..., min_length=1, max_length=128)
@@ -201,56 +202,45 @@ def check_license(request: Request, payload: CheckRequest):
     now = now_utc()
     key = (payload.license_key or "").strip().upper()
     key_row = None
-    key_error = None
 
-    # Validação se o usuário enviou uma chave PRO
     if key:
         key_row = row_to_dict(conn.execute("SELECT * FROM license_keys WHERE license_key = ?", (key,)).fetchone(), KEY_COLUMNS)
-        if key_row is None: key_error = "key_invalid"
-        elif key_row["revoked"]: key_error = "key_revoked"
-        else:
-            kexp = parse_dt(key_row["expires"])
-            if kexp and kexp <= now: key_error = "key_expired"
 
     row = row_to_dict(conn.execute("SELECT * FROM licenses WHERE machine_id = ?", (payload.machine_id,)).fetchone(), LICENSE_COLUMNS)
 
-    # 1. Chave enviada porém inválida/expirada
-    if key and key_error:
-        conn.close()
-        return signed_response(key_error, payload.machine_id)
-
-    # 2. Chave PRO válida
-    if key and key_row:
+    # 1. CLIENTE COM CHAVE PRO VÁLIDA CADASTRADA NO BANCO
+    if key and key_row and not key_row.get("revoked", 0):
         kexp = parse_dt(key_row["expires"])
         if kexp is None:
             kexp = now + timedelta(days=LICENSE_DAYS)
             conn.execute("UPDATE license_keys SET expires = ? WHERE license_key = ?", (kexp.isoformat(), key))
 
-        if row is None:
-            count = conn.execute("SELECT COUNT(*) FROM licenses WHERE license_key = ? AND revoked = 0", (key,)).fetchone()[0]
-            if count >= int(key_row["max_machines"] or MAX_MACHINES_PER_KEY):
+        if kexp > now:
+            if row is None:
+                count = conn.execute("SELECT COUNT(*) FROM licenses WHERE license_key = ? AND revoked = 0", (key,)).fetchone()[0]
+                if count >= int(key_row["max_machines"] or MAX_MACHINES_PER_KEY):
+                    conn.commit(); conn.close()
+                    return signed_response("limit", payload.machine_id)
+
+                conn.execute("""
+                    INSERT INTO licenses (machine_id, machine_name, first_seen, license_expires, last_seen, revoked, license_key, hardware_fingerprint)
+                    VALUES (?, ?, ?, ?, ?, 0, ?, ?)
+                """, (payload.machine_id, payload.machine_name, now.isoformat(), kexp.isoformat(), now.isoformat(), key, payload.hardware_fingerprint))
                 conn.commit(); conn.close()
-                return signed_response("limit", payload.machine_id)
+                return signed_response("licensed", payload.machine_id, kexp, max(0, (kexp - now).days))
 
             conn.execute("""
-                INSERT INTO licenses (machine_id, machine_name, first_seen, license_expires, last_seen, revoked, license_key, hardware_fingerprint)
-                VALUES (?, ?, ?, ?, ?, 0, ?, ?)
-            """, (payload.machine_id, payload.machine_name, now.isoformat(), kexp.isoformat(), now.isoformat(), key, payload.hardware_fingerprint))
+                UPDATE licenses SET last_seen = ?, machine_name = ?, license_key = ?, license_expires = ?, revoked = 0,
+                hardware_fingerprint = COALESCE(NULLIF(?, ''), hardware_fingerprint) WHERE machine_id = ?
+            """, (now.isoformat(), payload.machine_name or row["machine_name"], key, kexp.isoformat(), payload.hardware_fingerprint, payload.machine_id))
             conn.commit(); conn.close()
             return signed_response("licensed", payload.machine_id, kexp, max(0, (kexp - now).days))
 
-        conn.execute("""
-            UPDATE licenses SET last_seen = ?, machine_name = ?, license_key = ?, license_expires = ?, revoked = 0,
-            hardware_fingerprint = COALESCE(NULLIF(?, ''), hardware_fingerprint) WHERE machine_id = ?
-        """, (now.isoformat(), payload.machine_name or row["machine_name"], key, kexp.isoformat(), payload.hardware_fingerprint, payload.machine_id))
-        conn.commit(); conn.close()
-        return signed_response("licensed", payload.machine_id, kexp, max(0, (kexp - now).days))
-
-    # 3. NOVO CLIENTE: CRIAÇÃO AUTOMÁTICA E GARANTIDA DO TRIAL DE 3 DIAS
+    # 2. FLUXO DE TRIAL AUTOMÁTICO (NOVO USUÁRIO OU CHAVE EM BRANCO/EXPIRADA)
     trial_expires = now + timedelta(days=TRIAL_DAYS)
     
+    # Máquina nova: CRIA TRIAL DE 3 DIAS AUTOMATICAMENTE
     if row is None:
-        # Primeiro acesso desta máquina: CRIA O TRIAL IMEDIATAMENTE
         conn.execute("""
             INSERT INTO licenses (machine_id, machine_name, first_seen, license_expires, last_seen, revoked, license_key, hardware_fingerprint)
             VALUES (?, ?, ?, ?, ?, 0, NULL, ?)
@@ -259,11 +249,12 @@ def check_license(request: Request, payload: CheckRequest):
         conn.close()
         return signed_response("trial", payload.machine_id, trial_expires, TRIAL_DAYS)
     
-    # 4. CLIENTE EXISTENTE (TRIAL EM ANDAMENTO OU EXPIRADO)
+    # Se a máquina foi marcada manualmente como revogada pelo admin
     if row.get("revoked", 0) == 1:
         conn.close()
         return signed_response("revoked", payload.machine_id)
-        
+
+    # Máquina existente: checa se o trial de 3 dias ainda está ativo
     existing_expires = parse_dt(row["license_expires"])
     if existing_expires and existing_expires > now and not row.get("license_key"):
         days_left = max(0, (existing_expires - now).days)
@@ -275,14 +266,14 @@ def check_license(request: Request, payload: CheckRequest):
         conn.close()
         return signed_response("trial", payload.machine_id, existing_expires, days_left)
     
-    # Trial expirou
+    # Trial expirou e o cliente não possui chave paga
     conn.execute("UPDATE licenses SET last_seen = ? WHERE machine_id = ?", (now.isoformat(), payload.machine_id))
     conn.commit()
     conn.close()
     return signed_response("trial_expired", payload.machine_id)
 
 # ============================================================================
-# ESTILO CSS DARK PRO PARA O PAINEL WEB
+# ESTILOS CSS DARK PRO DO PAINEL WEB
 # ============================================================================
 _PAGE_STYLE = """
 <style>
@@ -324,7 +315,7 @@ tr:hover { background: #162438; }
 """
 
 # ============================================================================
-# PÁGINAS DO PAINEL ADMIN
+# PÁGINAS DO PAINEL WEB
 # ============================================================================
 def render_login_page(error: str = "") -> str:
     err_html = f'<div class="err">{escape(error)}</div>' if error else ""
@@ -624,7 +615,6 @@ def toggle_key_revoke(license_key: str = Form(...), session=Depends(require_admi
 # ============================================================================
 @app.post("/admin/reset-database")
 def reset_database(admin_pwd: str = Form(...), session=Depends(require_admin_csrf)):
-    # Valida se a senha digitada no modal bate com a senha do Admin
     if not hmac.compare_digest(admin_pwd, ADMIN_PASSWORD):
         return HTMLResponse(render_dashboard_page([], session.get("csrf", ""), "❌ Senha incorreta! O banco não foi alterado."), status_code=403)
     
