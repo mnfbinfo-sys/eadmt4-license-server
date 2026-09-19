@@ -1,17 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-EADMT4-PRO License Server v2.6 (Edição Profissional 2026)
-Melhorias sobre a v2.5:
- - CORREÇÃO DO 500 em /api/check: removido o "ALTER TABLE ... ADD COLUMN
-   hardware_fingerprint" que rodava em toda requisição e falhava sempre
-   (a coluna já existe no CREATE TABLE). No libsql, uma statement que falha
-   deixa a conexão suja e o commit seguinte estoura -> por isso as rotas de
-   leitura (painel) funcionavam e as de escrita (/api/check) davam 500.
- - Tabelas preparadas UMA vez no startup, não em toda request.
- - /api/check agora devolve JSON legível em caso de erro, em vez de
-   "Internal Server Error" cru, e imprime o traceback no log do Render.
- - Migração de schema feita de forma segura via PRAGMA table_info.
+EADMT4-PRO License Server v2.7 (Correção de Schema + Trial Expires)
+Melhorias sobre a v2.6:
+ - MIGRAÇÃO AUTOMÁTICA: Adiciona 'trial_expires' ao criar/atualizar tabela.
+ - CORREÇÃO DO 500 em /api/check: Evita ALTER TABLE duplicado.
+ - Respostas JSON legíveis em caso de erro de banco.
 """
 import asyncio
 import hashlib
@@ -114,13 +108,11 @@ async def _security_headers_middleware(request: Request, call_next):
 
 @app.on_event("startup")
 async def _on_startup():
-    # Prepara o schema UMA vez aqui. Antes isso rodava em toda requisição,
-    # e o ALTER TABLE que falhava sujava a conexão usada logo em seguida.
     try:
         conn = get_db()
         _ensure_core_tables(conn)
         conn.close()
-        print("[STARTUP] Schema verificado com sucesso.")
+        print("[STARTUP] Schema verificado e migrado com sucesso.")
     except Exception as e:
         print(f"[STARTUP ERROR] Falha ao preparar schema: {e}")
         traceback.print_exc()
@@ -134,11 +126,10 @@ async def _on_startup():
 # ============================================================================
 # BANCO DE DADOS (TURSO)
 # ============================================================================
-LICENSE_COLUMNS = ["machine_id", "machine_name", "first_seen", "license_expires", "last_seen", "revoked", "license_key", "hardware_fingerprint"]
+LICENSE_COLUMNS = ["machine_id", "machine_name", "first_seen", "license_expires", "last_seen", "revoked", "license_key", "hardware_fingerprint", "trial_expires"]
 KEY_COLUMNS = ["license_key", "created", "expires", "revoked", "max_machines"]
 
 def _table_columns(conn, table: str) -> List[str]:
-    """Lê as colunas existentes de uma tabela sem gerar erro."""
     try:
         rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
         return [r[1] for r in rows]
@@ -146,6 +137,7 @@ def _table_columns(conn, table: str) -> List[str]:
         return []
 
 def _ensure_core_tables(conn):
+    # CRIA AS TABELAS BASE COM TODAS AS COLUNAS NECESSÁRIAS
     conn.execute("""
     CREATE TABLE IF NOT EXISTS licenses (
         machine_id TEXT PRIMARY KEY,
@@ -155,9 +147,11 @@ def _ensure_core_tables(conn):
         last_seen TEXT,
         revoked INTEGER DEFAULT 0,
         license_key TEXT,
-        hardware_fingerprint TEXT
+        hardware_fingerprint TEXT,
+        trial_expires TEXT
     )
     """)
+    
     conn.execute("""
     CREATE TABLE IF NOT EXISTS license_keys (
         license_key TEXT PRIMARY KEY,
@@ -169,13 +163,17 @@ def _ensure_core_tables(conn):
     """)
     conn.commit()
 
-    # Migração segura: só executa o ALTER se a coluna realmente não existir.
-    # (Bancos criados por versões antigas não tinham hardware_fingerprint.)
+    # MIGRAÇÃO SEGURA: SÓ ADICIONA SE NÃO EXISTIR
     existing = _table_columns(conn, "licenses")
-    if existing and "hardware_fingerprint" not in existing:
-        print("[MIGRAÇÃO] Adicionando coluna hardware_fingerprint em licenses...")
-        conn.execute("ALTER TABLE licenses ADD COLUMN hardware_fingerprint TEXT")
-        conn.commit()
+    if existing and "trial_expires" not in existing:
+        print("[MIGRAÇÃO] Adicionando coluna trial_expires em licenses...")
+        try:
+            conn.execute("ALTER TABLE licenses ADD COLUMN trial_expires TEXT")
+            conn.commit()
+            print("[MIGRAÇÃO] Coluna trial_expires adicionada com sucesso!")
+        except Exception as e:
+            print(f"[MIGRAÇÃO ERRO] Falha ao adicionar coluna: {e}")
+            traceback.print_exc()
 
 def get_db():
     return libsql.connect(TURSO_DATABASE_URL, auth_token=TURSO_AUTH_TOKEN)
@@ -230,8 +228,6 @@ def check_license(request: Request, payload: CheckRequest):
         conn = get_db()
         return _do_check(conn, payload)
     except Exception as e:
-        # Antes isso virava um 500 "Internal Server Error" sem informação
-        # nenhuma. Agora o erro real aparece no log do Render E na resposta.
         print(f"[CHECK ERROR] {type(e).__name__}: {e}")
         traceback.print_exc()
         return {
@@ -250,7 +246,6 @@ def _do_check(conn, payload: CheckRequest) -> dict:
     key_row = None
     key_error = None
 
-    # Validação se o usuário enviou uma chave PRO
     if key:
         key_row = row_to_dict(conn.execute("SELECT * FROM license_keys WHERE license_key = ?", (key,)).fetchone(), KEY_COLUMNS)
         if key_row is None: key_error = "key_invalid"
@@ -261,11 +256,9 @@ def _do_check(conn, payload: CheckRequest) -> dict:
 
     row = row_to_dict(conn.execute("SELECT * FROM licenses WHERE machine_id = ?", (payload.machine_id,)).fetchone(), LICENSE_COLUMNS)
 
-    # 1. Chave enviada porém inválida/expirada
     if key and key_error:
         return signed_response(key_error, payload.machine_id)
 
-    # 2. Chave PRO válida
     if key and key_row:
         kexp = parse_dt(key_row["expires"])
         if kexp is None:
@@ -279,8 +272,8 @@ def _do_check(conn, payload: CheckRequest) -> dict:
                 return signed_response("limit", payload.machine_id)
 
             conn.execute("""
-                INSERT INTO licenses (machine_id, machine_name, first_seen, license_expires, last_seen, revoked, license_key, hardware_fingerprint)
-                VALUES (?, ?, ?, ?, ?, 0, ?, ?)
+                INSERT INTO licenses (machine_id, machine_name, first_seen, license_expires, last_seen, revoked, license_key, hardware_fingerprint, trial_expires)
+                VALUES (?, ?, ?, ?, ?, 0, ?, ?, NULL)
             """, (payload.machine_id, payload.machine_name, now.isoformat(), kexp.isoformat(), now.isoformat(), key, payload.hardware_fingerprint))
             conn.commit()
             print(f"[LICENÇA] Ativada chave {key} para machine_id={payload.machine_id[:16]}...")
@@ -288,25 +281,25 @@ def _do_check(conn, payload: CheckRequest) -> dict:
 
         conn.execute("""
             UPDATE licenses SET last_seen = ?, machine_name = ?, license_key = ?, license_expires = ?, revoked = 0,
-            hardware_fingerprint = COALESCE(NULLIF(?, ''), hardware_fingerprint) WHERE machine_id = ?
+            hardware_fingerprint = COALESCE(NULLIF(?, ''), hardware_fingerprint), trial_expires = NULL
+            WHERE machine_id = ?
         """, (now.isoformat(), payload.machine_name or row["machine_name"], key, kexp.isoformat(), payload.hardware_fingerprint, payload.machine_id))
         conn.commit()
         print(f"[LICENÇA] Renovada chave {key} para machine_id={payload.machine_id[:16]}...")
         return signed_response("licensed", payload.machine_id, kexp, max(0, (kexp - now).days))
 
-    # 3. NOVO CLIENTE: CRIAÇÃO AUTOMÁTICA E GARANTIDA DO TRIAL DE 3 DIAS
+    # TRIAL AUTOMÁTICO
     trial_expires = now + timedelta(days=TRIAL_DAYS)
 
     if row is None:
         conn.execute("""
-            INSERT INTO licenses (machine_id, machine_name, first_seen, license_expires, last_seen, revoked, license_key, hardware_fingerprint)
-            VALUES (?, ?, ?, ?, ?, 0, NULL, ?)
-        """, (payload.machine_id, payload.machine_name, now.isoformat(), trial_expires.isoformat(), now.isoformat(), payload.hardware_fingerprint))
+            INSERT INTO licenses (machine_id, machine_name, first_seen, license_expires, last_seen, revoked, license_key, hardware_fingerprint, trial_expires)
+            VALUES (?, ?, ?, ?, ?, 0, NULL, ?, ?)
+        """, (payload.machine_id, payload.machine_name, now.isoformat(), trial_expires.isoformat(), now.isoformat(), payload.hardware_fingerprint, trial_expires.isoformat()))
         conn.commit()
         print(f"[TRIAL] Novo trial de {TRIAL_DAYS} dias para machine_id={payload.machine_id[:16]}...")
         return signed_response("trial", payload.machine_id, trial_expires, TRIAL_DAYS)
 
-    # 4. CLIENTE EXISTENTE (TRIAL EM ANDAMENTO OU EXPIRADO)
     if row.get("revoked", 0) == 1:
         return signed_response("revoked", payload.machine_id)
 
@@ -320,7 +313,6 @@ def _do_check(conn, payload: CheckRequest) -> dict:
         conn.commit()
         return signed_response("trial", payload.machine_id, existing_expires, days_left)
 
-    # Trial expirou
     conn.execute("UPDATE licenses SET last_seen = ? WHERE machine_id = ?", (now.isoformat(), payload.machine_id))
     conn.commit()
     return signed_response("trial_expired", payload.machine_id)
@@ -377,7 +369,7 @@ def render_login_page(error: str = "") -> str:
 <body>
 <div class="wrap" style="max-width:400px; margin-top:100px;">
 <div class="card">
-<h1>⚡ EADMT4-PRO Admin</h1>
+<h1> EADMT4-PRO Admin</h1>
 <p style="color:#8e9eb5; font-size:13px; margin-bottom:20px;">Digite a senha mestra para gerenciar o servidor.</p>
 {err_html}
 <form method="post" action="/admin/login">
@@ -422,7 +414,7 @@ def render_dashboard_page(items: list, csrf_token: str, message: str = "") -> st
 <div class="wrap">
 <div class="card">
 <div class="topbar">
-<h1>⚡ EADMT4-PRO &mdash; Licenças dos Clientes</h1>
+<h1> EADMT4-PRO &mdash; Licenças dos Clientes</h1>
 <div>
 <a href="/admin/keys">🔑 Gerenciar Chaves PRO</a>
 <a href="/admin/logout" style="color:#ff3b56;">🚪 Sair</a>
@@ -438,11 +430,10 @@ def render_dashboard_page(items: list, csrf_token: str, message: str = "") -> st
 </table>
 </div>
 
-<!-- BLOCO DE SEGURANÇA: RESET GERAL DO BANCO -->
 <div class="card" style="border-color:#7f1d1d; background:#181017;">
 <div style="display:flex; justify-content:space-between; align-items:center;">
 <div>
-<h3 style="color:#f87171; margin:0 0 4px 0;">🚨 Zona Perigosa: Reset Geral do Sistema</h3>
+<h3 style="color:#f87171; margin:0 0 4px 0;"> Zona Perigosa: Reset Geral do Sistema</h3>
 <p style="color:#94a3b8; font-size:13px; margin:0;">Apaga todos os clientes cadastrados e todas as chaves geradas. Requer confirmação por senha.</p>
 </div>
 <button onclick="document.getElementById('resetModal').style.display='flex'" class="btn-danger btn-reset">🗑️ Resetar e Limpar Tudo</button>
@@ -451,10 +442,9 @@ def render_dashboard_page(items: list, csrf_token: str, message: str = "") -> st
 
 </div>
 
-<!-- MODAL DE CONFIRMAÇÃO POR SENHA -->
 <div id="resetModal" class="modal-bg">
 <div class="modal-box">
-<h3 style="color:#ff3b56; margin-top:0;">⚠️ Confirmar Exclusão Geral</h3>
+<h3 style="color:#ff3b56; margin-top:0;">️ Confirmar Exclusão Geral</h3>
 <p style="color:#cbd5e1; font-size:13px;">Tem certeza absoluta? Essa ação não pode ser desfeita e vai apagar todos os registros de licença.</p>
 <form method="post" action="/admin/reset-database">
 <input type="hidden" name="csrf_token" value="{escape(csrf_token)}">
@@ -660,9 +650,6 @@ def toggle_key_revoke(license_key: str = Form(...), session=Depends(require_admi
     conn.close()
     return RedirectResponse(url="/admin/keys", status_code=303)
 
-# ============================================================================
-# BOTÃO DE RESET TOTAL DO BANCO (COM CONFIRMAÇÃO POR SENHA)
-# ============================================================================
 @app.post("/admin/reset-database")
 def reset_database(admin_pwd: str = Form(...), session=Depends(require_admin_csrf)):
     if not hmac.compare_digest(admin_pwd, ADMIN_PASSWORD):
@@ -679,21 +666,16 @@ def reset_database(admin_pwd: str = Form(...), session=Depends(require_admin_csr
         conn.close()
         raise HTTPException(status_code=500, detail=str(e))
 
-# ============================================================================
-# DIAGNÓSTICO - útil para testar o banco sem depender do log do Render
-# ============================================================================
 @app.get("/api/health")
 def health():
-    """Testa leitura E escrita no banco. Não expõe dado sensível."""
     try:
         conn = get_db()
         cols = _table_columns(conn, "licenses")
         n_lic = conn.execute("SELECT COUNT(*) FROM licenses").fetchone()[0]
         n_keys = conn.execute("SELECT COUNT(*) FROM license_keys").fetchone()[0]
-        # teste real de escrita + rollback lógico (insere e apaga um registro fake)
         probe_id = f"__healthcheck__{int(time.time())}"
-        conn.execute("INSERT INTO licenses (machine_id, machine_name, first_seen, license_expires, last_seen, revoked) VALUES (?, 'probe', ?, ?, ?, 0)",
-                     (probe_id, now_utc().isoformat(), now_utc().isoformat(), now_utc().isoformat()))
+        conn.execute("INSERT INTO licenses (machine_id, machine_name, first_seen, license_expires, last_seen, revoked, trial_expires) VALUES (?, 'probe', ?, ?, ?, 0, ?)",
+                     (probe_id, now_utc().isoformat(), now_utc().isoformat(), now_utc().isoformat(), now_utc().isoformat()))
         conn.commit()
         conn.execute("DELETE FROM licenses WHERE machine_id = ?", (probe_id,))
         conn.commit()
@@ -705,4 +687,4 @@ def health():
 
 @app.api_route("/", methods=["GET", "HEAD"])
 def root():
-    return {"service": "EADMT4-PRO License Server", "status": "online", "trial_days": TRIAL_DAYS, "version": "2.6"}
+    return {"service": "EADMT4-PRO License Server", "status": "online", "trial_days": TRIAL_DAYS, "version": "2.7"}
