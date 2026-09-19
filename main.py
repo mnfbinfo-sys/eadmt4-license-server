@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-EADMT4-PRO License Server v2.5 (Edição Profissional 2026)
-Melhorias:
- - Garantia absoluta de Trial de 3 dias para novos clientes (Bug fix no schema)
- - Interface Web Admin Dark High-Tech moderna
- - Botão de Reset Completo do Banco com Proteção por Senha de Administrador
- - Rate-limit em memória (Zero custos extras no Turso)
+EADMT4-PRO License Server v2.6 (Edição Profissional 2026)
+Melhorias sobre a v2.5:
+ - CORREÇÃO DO 500 em /api/check: removido o "ALTER TABLE ... ADD COLUMN
+   hardware_fingerprint" que rodava em toda requisição e falhava sempre
+   (a coluna já existe no CREATE TABLE). No libsql, uma statement que falha
+   deixa a conexão suja e o commit seguinte estoura -> por isso as rotas de
+   leitura (painel) funcionavam e as de escrita (/api/check) davam 500.
+ - Tabelas preparadas UMA vez no startup, não em toda request.
+ - /api/check agora devolve JSON legível em caso de erro, em vez de
+   "Internal Server Error" cru, e imprime o traceback no log do Render.
+ - Migração de schema feita de forma segura via PRAGMA table_info.
 """
 import asyncio
 import hashlib
@@ -15,6 +20,7 @@ import os
 import secrets
 import string
 import time
+import traceback
 import libsql
 from datetime import datetime, timedelta, timezone
 from html import escape
@@ -54,23 +60,23 @@ RATE_LIMIT_WINDOW_SEC = 60
 class InMemoryRateLimiter:
     def __init__(self):
         self.requests: Dict[str, List[int]] = {}
-    
+
     def is_limited(self, bucket: str, key: str, max_requests: int, window: int = RATE_LIMIT_WINDOW_SEC) -> bool:
         now = int(time.time())
         cutoff = now - window
         composite_key = f"{bucket}:{key}"
-        
+
         if composite_key in self.requests:
             self.requests[composite_key] = [ts for ts in self.requests[composite_key] if ts > cutoff]
-        
+
         if len(self.requests.get(composite_key, [])) >= max_requests:
             return True
-        
+
         if composite_key not in self.requests:
             self.requests[composite_key] = []
         self.requests[composite_key].append(now)
         return False
-    
+
     def cleanup(self):
         now = int(time.time())
         cutoff = now - RATE_LIMIT_WINDOW_SEC
@@ -108,6 +114,17 @@ async def _security_headers_middleware(request: Request, call_next):
 
 @app.on_event("startup")
 async def _on_startup():
+    # Prepara o schema UMA vez aqui. Antes isso rodava em toda requisição,
+    # e o ALTER TABLE que falhava sujava a conexão usada logo em seguida.
+    try:
+        conn = get_db()
+        _ensure_core_tables(conn)
+        conn.close()
+        print("[STARTUP] Schema verificado com sucesso.")
+    except Exception as e:
+        print(f"[STARTUP ERROR] Falha ao preparar schema: {e}")
+        traceback.print_exc()
+
     async def cleanup_loop():
         while True:
             await asyncio.sleep(6 * 60 * 60)
@@ -119,6 +136,14 @@ async def _on_startup():
 # ============================================================================
 LICENSE_COLUMNS = ["machine_id", "machine_name", "first_seen", "license_expires", "last_seen", "revoked", "license_key", "hardware_fingerprint"]
 KEY_COLUMNS = ["license_key", "created", "expires", "revoked", "max_machines"]
+
+def _table_columns(conn, table: str) -> List[str]:
+    """Lê as colunas existentes de uma tabela sem gerar erro."""
+    try:
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        return [r[1] for r in rows]
+    except Exception:
+        return []
 
 def _ensure_core_tables(conn):
     conn.execute("""
@@ -142,11 +167,15 @@ def _ensure_core_tables(conn):
         max_machines INTEGER
     )
     """)
-    try:
+    conn.commit()
+
+    # Migração segura: só executa o ALTER se a coluna realmente não existir.
+    # (Bancos criados por versões antigas não tinham hardware_fingerprint.)
+    existing = _table_columns(conn, "licenses")
+    if existing and "hardware_fingerprint" not in existing:
+        print("[MIGRAÇÃO] Adicionando coluna hardware_fingerprint em licenses...")
         conn.execute("ALTER TABLE licenses ADD COLUMN hardware_fingerprint TEXT")
         conn.commit()
-    except Exception:
-        pass
 
 def get_db():
     return libsql.connect(TURSO_DATABASE_URL, auth_token=TURSO_AUTH_TOKEN)
@@ -196,8 +225,26 @@ def check_license(request: Request, payload: CheckRequest):
     if rate_limiter.is_limited("check", _client_ip(request), CHECK_MAX_REQUESTS):
         return {"status": "error", "expires_at": None, "days_left": 0, "sig": "", "timestamp": None}
 
-    conn = get_db()
-    _ensure_core_tables(conn)
+    conn = None
+    try:
+        conn = get_db()
+        return _do_check(conn, payload)
+    except Exception as e:
+        # Antes isso virava um 500 "Internal Server Error" sem informação
+        # nenhuma. Agora o erro real aparece no log do Render E na resposta.
+        print(f"[CHECK ERROR] {type(e).__name__}: {e}")
+        traceback.print_exc()
+        return {
+            "status": "error",
+            "error": f"{type(e).__name__}: {e}",
+            "expires_at": None, "days_left": 0, "sig": "", "timestamp": None
+        }
+    finally:
+        if conn is not None:
+            try: conn.close()
+            except Exception: pass
+
+def _do_check(conn, payload: CheckRequest) -> dict:
     now = now_utc()
     key = (payload.license_key or "").strip().upper()
     key_row = None
@@ -216,7 +263,6 @@ def check_license(request: Request, payload: CheckRequest):
 
     # 1. Chave enviada porém inválida/expirada
     if key and key_error:
-        conn.close()
         return signed_response(key_error, payload.machine_id)
 
     # 2. Chave PRO válida
@@ -229,41 +275,41 @@ def check_license(request: Request, payload: CheckRequest):
         if row is None:
             count = conn.execute("SELECT COUNT(*) FROM licenses WHERE license_key = ? AND revoked = 0", (key,)).fetchone()[0]
             if count >= int(key_row["max_machines"] or MAX_MACHINES_PER_KEY):
-                conn.commit(); conn.close()
+                conn.commit()
                 return signed_response("limit", payload.machine_id)
 
             conn.execute("""
                 INSERT INTO licenses (machine_id, machine_name, first_seen, license_expires, last_seen, revoked, license_key, hardware_fingerprint)
                 VALUES (?, ?, ?, ?, ?, 0, ?, ?)
             """, (payload.machine_id, payload.machine_name, now.isoformat(), kexp.isoformat(), now.isoformat(), key, payload.hardware_fingerprint))
-            conn.commit(); conn.close()
+            conn.commit()
+            print(f"[LICENÇA] Ativada chave {key} para machine_id={payload.machine_id[:16]}...")
             return signed_response("licensed", payload.machine_id, kexp, max(0, (kexp - now).days))
 
         conn.execute("""
             UPDATE licenses SET last_seen = ?, machine_name = ?, license_key = ?, license_expires = ?, revoked = 0,
             hardware_fingerprint = COALESCE(NULLIF(?, ''), hardware_fingerprint) WHERE machine_id = ?
         """, (now.isoformat(), payload.machine_name or row["machine_name"], key, kexp.isoformat(), payload.hardware_fingerprint, payload.machine_id))
-        conn.commit(); conn.close()
+        conn.commit()
+        print(f"[LICENÇA] Renovada chave {key} para machine_id={payload.machine_id[:16]}...")
         return signed_response("licensed", payload.machine_id, kexp, max(0, (kexp - now).days))
 
     # 3. NOVO CLIENTE: CRIAÇÃO AUTOMÁTICA E GARANTIDA DO TRIAL DE 3 DIAS
     trial_expires = now + timedelta(days=TRIAL_DAYS)
-    
+
     if row is None:
-        # Primeiro acesso desta máquina: CRIA O TRIAL IMEDIATAMENTE
         conn.execute("""
             INSERT INTO licenses (machine_id, machine_name, first_seen, license_expires, last_seen, revoked, license_key, hardware_fingerprint)
             VALUES (?, ?, ?, ?, ?, 0, NULL, ?)
         """, (payload.machine_id, payload.machine_name, now.isoformat(), trial_expires.isoformat(), now.isoformat(), payload.hardware_fingerprint))
         conn.commit()
-        conn.close()
+        print(f"[TRIAL] Novo trial de {TRIAL_DAYS} dias para machine_id={payload.machine_id[:16]}...")
         return signed_response("trial", payload.machine_id, trial_expires, TRIAL_DAYS)
-    
+
     # 4. CLIENTE EXISTENTE (TRIAL EM ANDAMENTO OU EXPIRADO)
     if row.get("revoked", 0) == 1:
-        conn.close()
         return signed_response("revoked", payload.machine_id)
-        
+
     existing_expires = parse_dt(row["license_expires"])
     if existing_expires and existing_expires > now and not row.get("license_key"):
         days_left = max(0, (existing_expires - now).days)
@@ -272,13 +318,11 @@ def check_license(request: Request, payload: CheckRequest):
             WHERE machine_id = ?
         """, (now.isoformat(), payload.machine_name or row["machine_name"], payload.hardware_fingerprint, payload.machine_id))
         conn.commit()
-        conn.close()
         return signed_response("trial", payload.machine_id, existing_expires, days_left)
-    
+
     # Trial expirou
     conn.execute("UPDATE licenses SET last_seen = ? WHERE machine_id = ?", (now.isoformat(), payload.machine_id))
     conn.commit()
-    conn.close()
     return signed_response("trial_expired", payload.machine_id)
 
 # ============================================================================
@@ -526,7 +570,6 @@ def logout():
 @app.get("/admin", response_class=HTMLResponse)
 def dashboard(session=Depends(require_admin)):
     conn = get_db()
-    _ensure_core_tables(conn)
     rows = conn.execute("SELECT * FROM licenses ORDER BY last_seen DESC").fetchall()
     conn.close()
     now = now_utc()
@@ -578,7 +621,6 @@ def toggle_license_revoke(machine_id: str = Form(...), session=Depends(require_a
 @app.get("/admin/keys", response_class=HTMLResponse)
 def list_keys(nova: str = "", session=Depends(require_admin)):
     conn = get_db()
-    _ensure_core_tables(conn)
     rows = conn.execute("SELECT * FROM license_keys ORDER BY created DESC").fetchall()
     conn.close()
     keys = [row_to_dict(r, KEY_COLUMNS) for r in rows]
@@ -588,7 +630,6 @@ def list_keys(nova: str = "", session=Depends(require_admin)):
 @app.post("/admin/keygen")
 def keygen(days: Optional[int] = Form(None), session=Depends(require_admin_csrf)):
     conn = get_db()
-    _ensure_core_tables(conn)
     new_key = generate_key()
     for _ in range(5):
         exists = conn.execute("SELECT 1 FROM license_keys WHERE license_key = ?", (new_key,)).fetchone()
@@ -624,12 +665,10 @@ def toggle_key_revoke(license_key: str = Form(...), session=Depends(require_admi
 # ============================================================================
 @app.post("/admin/reset-database")
 def reset_database(admin_pwd: str = Form(...), session=Depends(require_admin_csrf)):
-    # Valida se a senha digitada no modal bate com a senha do Admin
     if not hmac.compare_digest(admin_pwd, ADMIN_PASSWORD):
         return HTMLResponse(render_dashboard_page([], session.get("csrf", ""), "❌ Senha incorreta! O banco não foi alterado."), status_code=403)
-    
+
     conn = get_db()
-    _ensure_core_tables(conn)
     try:
         conn.execute("DELETE FROM licenses")
         conn.execute("DELETE FROM license_keys")
@@ -640,6 +679,30 @@ def reset_database(admin_pwd: str = Form(...), session=Depends(require_admin_csr
         conn.close()
         raise HTTPException(status_code=500, detail=str(e))
 
+# ============================================================================
+# DIAGNÓSTICO - útil para testar o banco sem depender do log do Render
+# ============================================================================
+@app.get("/api/health")
+def health():
+    """Testa leitura E escrita no banco. Não expõe dado sensível."""
+    try:
+        conn = get_db()
+        cols = _table_columns(conn, "licenses")
+        n_lic = conn.execute("SELECT COUNT(*) FROM licenses").fetchone()[0]
+        n_keys = conn.execute("SELECT COUNT(*) FROM license_keys").fetchone()[0]
+        # teste real de escrita + rollback lógico (insere e apaga um registro fake)
+        probe_id = f"__healthcheck__{int(time.time())}"
+        conn.execute("INSERT INTO licenses (machine_id, machine_name, first_seen, license_expires, last_seen, revoked) VALUES (?, 'probe', ?, ?, ?, 0)",
+                     (probe_id, now_utc().isoformat(), now_utc().isoformat(), now_utc().isoformat()))
+        conn.commit()
+        conn.execute("DELETE FROM licenses WHERE machine_id = ?", (probe_id,))
+        conn.commit()
+        conn.close()
+        return {"db": "ok", "write": "ok", "licenses": n_lic, "keys": n_keys, "licenses_columns": cols}
+    except Exception as e:
+        traceback.print_exc()
+        return {"db": "fail", "error": f"{type(e).__name__}: {e}"}
+
 @app.api_route("/", methods=["GET", "HEAD"])
 def root():
-    return {"service": "EADMT4-PRO License Server", "status": "online", "trial_days": TRIAL_DAYS}
+    return {"service": "EADMT4-PRO License Server", "status": "online", "trial_days": TRIAL_DAYS, "version": "2.6"}
