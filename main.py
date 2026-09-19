@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-EADMT4-PRO License Server v2.9 (Definitivo - Sem travamento de CSRF no Keygen)
+EADMT4-PRO License Server v3.0 (Correção Definitiva Datetime Timezone + LibSQL Turso)
 """
 import asyncio
 import hashlib
@@ -144,17 +144,21 @@ def row_to_dict(row, columns):
     if not row: return None
     return dict(zip(columns, row))
 
-def now_utc():
+def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
-def parse_dt(s):
+def parse_dt(s) -> Optional[datetime]:
     if not s: return None
     try:
-        return datetime.fromisoformat(str(s))
+        clean = str(s).strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(clean)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
     except Exception:
         return None
 
-def generate_key():
+def generate_key() -> str:
     alphabet = string.ascii_uppercase + string.digits
     part = lambda: "".join(secrets.choice(alphabet) for _ in range(4))
     return "EAD-" + part() + "-" + part() + "-" + part()
@@ -208,37 +212,42 @@ def check_license(request: Request, payload: CheckRequest):
 
         # 1. Chave PRO Válida
         if key and key_row and not key_row.get("revoked", 0):
-            kexp = parse_dt(key_row["expires"])
+            kexp = parse_dt(key_row.get("expires"))
+            
+            is_valid = False
+            days_left = 9999
             if kexp is None:
-                kexp = now + timedelta(days=LICENSE_DAYS)
-                conn.execute("UPDATE license_keys SET expires = ? WHERE license_key = ?", (kexp.isoformat(), key))
-                try: conn.commit()
-                except Exception: pass
+                is_valid = True
+            else:
+                diff_seconds = (kexp - now).total_seconds()
+                if diff_seconds > 0:
+                    is_valid = True
+                    days_left = max(0, int(diff_seconds // 86400))
 
-            if kexp > now:
+            if is_valid:
                 if row is None:
                     count = conn.execute("SELECT COUNT(*) FROM licenses WHERE license_key = ? AND revoked = 0", (key,)).fetchone()[0]
-                    if count >= int(key_row["max_machines"] or MAX_MACHINES_PER_KEY):
+                    if count >= int(key_row.get("max_machines") or MAX_MACHINES_PER_KEY):
                         conn.close()
                         return signed_response("limit", payload.machine_id)
 
                     conn.execute("""
                         INSERT INTO licenses (machine_id, machine_name, first_seen, license_expires, last_seen, revoked, license_key, hardware_fingerprint)
                         VALUES (?, ?, ?, ?, ?, 0, ?, ?)
-                    """, (payload.machine_id, payload.machine_name, now.isoformat(), kexp.isoformat(), now.isoformat(), key, payload.hardware_fingerprint))
+                    """, (payload.machine_id, payload.machine_name, now.isoformat(), kexp.isoformat() if kexp else None, now.isoformat(), key, payload.hardware_fingerprint))
                     try: conn.commit()
                     except Exception: pass
                     conn.close()
-                    return signed_response("licensed", payload.machine_id, kexp, max(0, (kexp - now).days))
+                    return signed_response("licensed", payload.machine_id, kexp, days_left)
 
                 conn.execute("""
                     UPDATE licenses SET last_seen = ?, machine_name = ?, license_key = ?, license_expires = ?, revoked = 0,
                     hardware_fingerprint = COALESCE(NULLIF(?, ''), hardware_fingerprint) WHERE machine_id = ?
-                """, (now.isoformat(), payload.machine_name or row["machine_name"], key, kexp.isoformat(), payload.hardware_fingerprint, payload.machine_id))
+                """, (now.isoformat(), payload.machine_name or row.get("machine_name"), key, kexp.isoformat() if kexp else None, payload.hardware_fingerprint, payload.machine_id))
                 try: conn.commit()
                 except Exception: pass
                 conn.close()
-                return signed_response("licensed", payload.machine_id, kexp, max(0, (kexp - now).days))
+                return signed_response("licensed", payload.machine_id, kexp, days_left)
 
         # 2. NOVO CLIENTE -> CRIA TRIAL DE 3 DIAS
         trial_expires = now + timedelta(days=TRIAL_DAYS)
@@ -258,17 +267,22 @@ def check_license(request: Request, payload: CheckRequest):
             conn.close()
             return signed_response("revoked", payload.machine_id)
 
-        existing_expires = parse_dt(row["license_expires"])
-        if existing_expires and existing_expires > now and not row.get("license_key"):
-            days_left = max(0, (existing_expires - now).days)
+        existing_expires = parse_dt(row.get("license_expires"))
+        if existing_expires and (existing_expires - now).total_seconds() > 0 and not row.get("license_key"):
+            days_left = max(0, int((existing_expires - now).total_seconds() // 86400))
             conn.execute("""
                 UPDATE licenses SET last_seen = ?, machine_name = ?, hardware_fingerprint = COALESCE(NULLIF(?, ''), hardware_fingerprint)
                 WHERE machine_id = ?
-            """, (now.isoformat(), payload.machine_name or row["machine_name"], payload.hardware_fingerprint, payload.machine_id))
+            """, (now.isoformat(), payload.machine_name or row.get("machine_name"), payload.hardware_fingerprint, payload.machine_id))
             try: conn.commit()
             except Exception: pass
             conn.close()
             return signed_response("trial", payload.machine_id, existing_expires, days_left)
+
+        # Se tiver chave vinculada na máquina, mas expirou
+        if row.get("license_key"):
+            conn.close()
+            return signed_response("expired", payload.machine_id)
 
         # Trial expirou
         conn.execute("UPDATE licenses SET last_seen = ? WHERE machine_id = ?", (now.isoformat(), payload.machine_id))
@@ -280,7 +294,7 @@ def check_license(request: Request, payload: CheckRequest):
     except Exception as e:
         print("[ERRO FATAL NA ROTA /api/check]:")
         traceback.print_exc()
-        return JSONResponse(status_code=500, content={"status": "error", "error": str(e)})
+        return JSONResponse(status_code=500, content={"status": "error", "error": str(e), "trace": traceback.format_exc()})
 
 # ============================================================================
 # ESTILOS E INTERFACE DO PAINEL WEB
@@ -446,17 +460,19 @@ def dashboard(session=Depends(require_admin)):
     items = []
     for r_raw in rows:
         r = row_to_dict(r_raw, LICENSE_COLUMNS)
-        license_expires = parse_dt(r["license_expires"])
+        license_expires = parse_dt(r.get("license_expires"))
 
         if r.get("revoked", 0) == 1:
             status, status_class = "revogado", "revogado"
         elif not r.get("license_key"):
-            if license_expires and license_expires > now:
+            if license_expires and (license_expires - now).total_seconds() > 0:
                 status, status_class = "trial (ativo)", "trial"
             else:
                 status, status_class = "trial expirado", "expirado"
-        elif license_expires and license_expires > now:
+        elif license_expires and (license_expires - now).total_seconds() > 0:
             status, status_class = "pro licenciado", "licenciado"
+        elif license_expires is None and r.get("license_key"):
+            status, status_class = "pro vitalício", "licenciado"
         else:
             status, status_class = "expirado", "expirado"
 
@@ -468,7 +484,7 @@ def dashboard(session=Depends(require_admin)):
             "last_seen": (r["last_seen"] or "")[:16].replace("T", " "),
             "status": status,
             "status_class": status_class,
-            "license_expires": license_expires.strftime("%d/%m/%Y %H:%M") if license_expires else "-",
+            "license_expires": license_expires.strftime("%d/%m/%Y %H:%M") if license_expires else "Vitalício",
             "hw_fingerprint": fp[:12] + "…" if fp else "-",
         })
 
