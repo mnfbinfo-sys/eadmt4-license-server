@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-EADMT4-PRO License Server v3.5 (Recuperação e Ativação Estável)
+EADMT4-PRO License Server v3.6 (Resolução do NOT NULL em trial_expires)
 """
 import asyncio
 import hashlib
@@ -65,38 +65,6 @@ def make_response(status: str, machine_id: str, days_left: int = 0, expires_at: 
         "sig": sig
     }
 
-@app.on_event("startup")
-def init_tables():
-    try:
-        conn = get_db()
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS licenses (
-                machine_id TEXT PRIMARY KEY,
-                machine_name TEXT,
-                first_seen TEXT,
-                license_expires TEXT,
-                last_seen TEXT,
-                revoked INTEGER DEFAULT 0,
-                license_key TEXT,
-                hardware_fingerprint TEXT
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS license_keys (
-                license_key TEXT PRIMARY KEY,
-                created TEXT,
-                expires TEXT,
-                revoked INTEGER DEFAULT 0,
-                max_machines INTEGER DEFAULT 2
-            )
-        """)
-        try: conn.commit()
-        except: pass
-        conn.close()
-        print("[DB] Tabelas prontas.")
-    except Exception as e:
-        print(f"[DB INIT ERROR] {e}")
-
 class CheckPayload(BaseModel):
     machine_id: str
     machine_name: Optional[str] = ""
@@ -112,7 +80,6 @@ def check_license(payload: CheckPayload):
         m_name = str(payload.machine_name or "PC-Trader").strip()
         hw_fp = str(payload.hardware_fingerprint or "").strip()
         key = str(payload.license_key or "").strip().upper()
-        now_ts = int(time.time())
 
         # 1. VERIFICAR SE O CLIENTE JÁ EXISTE NO BANCO
         row = conn.execute("SELECT machine_id, revoked, license_key, license_expires FROM licenses WHERE machine_id = ?", (m_id,)).fetchone()
@@ -147,18 +114,18 @@ def check_license(payload: CheckPayload):
                 except:
                     pass
 
-            # Salva / Atualiza o cliente como PRO
+            # Salva / Atualiza o cliente como PRO (Preenchendo trial_expires com exp_str para não falhar o NOT NULL)
             if row:
                 conn.execute("""
                     UPDATE licenses 
-                    SET last_seen = ?, machine_name = ?, license_key = ?, license_expires = ?, revoked = 0, hardware_fingerprint = ?
+                    SET last_seen = ?, machine_name = ?, license_key = ?, license_expires = ?, revoked = 0, hardware_fingerprint = ?, trial_expires = ?
                     WHERE machine_id = ?
-                """, (now_utc_iso(), m_name, key, exp_str, hw_fp, m_id))
+                """, (now_utc_iso(), m_name, key, exp_str, hw_fp, exp_str, m_id))
             else:
                 conn.execute("""
-                    INSERT INTO licenses (machine_id, machine_name, first_seen, license_expires, last_seen, revoked, license_key, hardware_fingerprint)
-                    VALUES (?, ?, ?, ?, ?, 0, ?, ?)
-                """, (m_id, m_name, now_utc_iso(), exp_str, now_utc_iso(), key, hw_fp))
+                    INSERT INTO licenses (machine_id, machine_name, first_seen, license_expires, last_seen, revoked, license_key, hardware_fingerprint, trial_expires)
+                    VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)
+                """, (m_id, m_name, now_utc_iso(), exp_str, now_utc_iso(), key, hw_fp, exp_str))
 
             try: conn.commit()
             except: pass
@@ -189,7 +156,6 @@ def check_license(payload: CheckPayload):
             except: pass
             conn.close()
 
-            # Checa se o trial venceu
             days_left = 0
             if saved_exp:
                 try:
@@ -208,9 +174,9 @@ def check_license(payload: CheckPayload):
         trial_iso = trial_dt.isoformat()
         
         conn.execute("""
-            INSERT INTO licenses (machine_id, machine_name, first_seen, license_expires, last_seen, revoked, license_key, hardware_fingerprint)
-            VALUES (?, ?, ?, ?, ?, 0, '', ?)
-        """, (m_id, m_name, now_utc_iso(), trial_iso, now_utc_iso(), hw_fp))
+            INSERT INTO licenses (machine_id, machine_name, first_seen, license_expires, last_seen, revoked, license_key, hardware_fingerprint, trial_expires)
+            VALUES (?, ?, ?, ?, ?, 0, '', ?, ?)
+        """, (m_id, m_name, now_utc_iso(), trial_iso, now_utc_iso(), hw_fp, trial_iso))
         
         try: conn.commit()
         except: pass
