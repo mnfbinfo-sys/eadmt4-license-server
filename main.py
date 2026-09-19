@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-EADMT4-PRO License Server v3.0 (Correção Definitiva Datetime Timezone + LibSQL Turso)
+EADMT4-PRO License Server v3.1 (Correção Datetime Timezone + LibSQL Turso
+                                 + restauração da migração defensiva de colunas)
 """
 import asyncio
 import hashlib
@@ -103,12 +104,32 @@ async def _on_startup():
         conn = get_db()
         _ensure_core_tables(conn)
         conn.close()
-        print("[DATABASE] Tabelas verificadas na inicialização.")
+        print("[DATABASE] Tabelas verificadas/migradas com sucesso na inicialização.")
     except Exception as e:
         print(f"[DATABASE INIT ERROR] {e}")
 
 LICENSE_COLUMNS = ["machine_id", "machine_name", "first_seen", "license_expires", "last_seen", "revoked", "license_key", "hardware_fingerprint"]
 KEY_COLUMNS = ["license_key", "created", "expires", "revoked", "max_machines"]
+
+def _safe_add_column(conn, table: str, column: str, coltype: str):
+    """Adiciona uma coluna a uma tabela já existente, se ela ainda não existir.
+    Necessário porque 'CREATE TABLE IF NOT EXISTS' NUNCA altera uma tabela que
+    já existe - então um banco criado por uma versão antiga deste script, sem
+    uma coluna nova (ex.: hardware_fingerprint ou max_machines), continuaria
+    sem ela para sempre, e todo INSERT/UPDATE que citasse essa coluna quebraria
+    a rota /api/check com um 500 - que o app cliente confunde com licença
+    expirada/inválida em vez de mostrar o erro real.
+    """
+    try:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+        try:
+            conn.commit()
+        except Exception:
+            pass
+        print(f"[DATABASE] Coluna '{column}' adicionada à tabela '{table}'.")
+    except Exception:
+        # Coluna já existe (caso mais comum) ou outro erro não crítico - ignora.
+        pass
 
 def _ensure_core_tables(conn):
     conn.execute("""
@@ -136,6 +157,11 @@ def _ensure_core_tables(conn):
         conn.commit()
     except Exception:
         pass
+
+    # Migração defensiva: garante que bancos criados por versões antigas
+    # ganhem as colunas novas em vez de quebrar o /api/check silenciosamente.
+    _safe_add_column(conn, "licenses", "hardware_fingerprint", "TEXT")
+    _safe_add_column(conn, "license_keys", "max_machines", "INTEGER DEFAULT 2")
 
 def get_db():
     return libsql.connect(TURSO_DATABASE_URL, auth_token=TURSO_AUTH_TOKEN)
