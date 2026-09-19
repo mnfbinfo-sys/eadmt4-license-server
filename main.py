@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-EADMT4-PRO License Server v3.1 (Correção Definitiva do Keygen e Datetime Timezone)
+EADMT4-PRO License Server v3.2 (Correção Vitalícia + LibSQL Bindings Blindados)
 """
 import asyncio
 import hashlib
@@ -170,9 +170,10 @@ def sign_heartbeat(status: str, machine_id: str, timestamp: int) -> str:
 def signed_response(status: str, machine_id: str, expires_at=None, days_left: int = 0) -> dict:
     timestamp = int(now_utc().timestamp())
     sig = sign_heartbeat(status, machine_id, timestamp)
+    exp_str = expires_at.isoformat() if isinstance(expires_at, datetime) else (str(expires_at) if expires_at else None)
     return {
         "status": status,
-        "expires_at": expires_at.isoformat() if expires_at else None,
+        "expires_at": exp_str,
         "days_left": days_left,
         "timestamp": timestamp,
         "sig": sig
@@ -217,14 +218,23 @@ def check_license(request: Request, payload: CheckRequest):
             is_valid = False
             days_left = 9999
             if kexp is None:
+                # Chave vitalícia
                 is_valid = True
+                save_exp_str = "2099-12-31T23:59:59+00:00"
             else:
                 diff_seconds = (kexp - now).total_seconds()
                 if diff_seconds > 0:
                     is_valid = True
                     days_left = max(0, int(diff_seconds // 86400))
+                    save_exp_str = kexp.isoformat()
+                else:
+                    is_valid = False
+                    save_exp_str = kexp.isoformat()
 
             if is_valid:
+                m_name = str(payload.machine_name or (row.get("machine_name") if row else "") or "PC-Trader")
+                hw_fp = str(payload.hardware_fingerprint or (row.get("hardware_fingerprint") if row else "") or "")
+                
                 if row is None:
                     count = conn.execute("SELECT COUNT(*) FROM licenses WHERE license_key = ? AND revoked = 0", (key,)).fetchone()[0]
                     if count >= int(key_row.get("max_machines") or MAX_MACHINES_PER_KEY):
@@ -234,7 +244,7 @@ def check_license(request: Request, payload: CheckRequest):
                     conn.execute("""
                         INSERT INTO licenses (machine_id, machine_name, first_seen, license_expires, last_seen, revoked, license_key, hardware_fingerprint)
                         VALUES (?, ?, ?, ?, ?, 0, ?, ?)
-                    """, (payload.machine_id, payload.machine_name, now.isoformat(), kexp.isoformat() if kexp else None, now.isoformat(), key, payload.hardware_fingerprint))
+                    """, (payload.machine_id, m_name, now.isoformat(), save_exp_str, now.isoformat(), key, hw_fp))
                     try: conn.commit()
                     except Exception: pass
                     conn.close()
@@ -242,8 +252,8 @@ def check_license(request: Request, payload: CheckRequest):
 
                 conn.execute("""
                     UPDATE licenses SET last_seen = ?, machine_name = ?, license_key = ?, license_expires = ?, revoked = 0,
-                    hardware_fingerprint = COALESCE(NULLIF(?, ''), hardware_fingerprint) WHERE machine_id = ?
-                """, (now.isoformat(), payload.machine_name or row.get("machine_name"), key, kexp.isoformat() if kexp else None, payload.hardware_fingerprint, payload.machine_id))
+                    hardware_fingerprint = ? WHERE machine_id = ?
+                """, (now.isoformat(), m_name, key, save_exp_str, hw_fp, payload.machine_id))
                 try: conn.commit()
                 except Exception: pass
                 conn.close()
@@ -251,12 +261,15 @@ def check_license(request: Request, payload: CheckRequest):
 
         # 2. NOVO CLIENTE -> CRIA TRIAL DE 3 DIAS
         trial_expires = now + timedelta(days=TRIAL_DAYS)
+        trial_exp_str = trial_expires.isoformat()
+        m_name = str(payload.machine_name or "PC-Trader")
+        hw_fp = str(payload.hardware_fingerprint or "")
 
         if row is None:
             conn.execute("""
                 INSERT INTO licenses (machine_id, machine_name, first_seen, license_expires, last_seen, revoked, license_key, hardware_fingerprint)
-                VALUES (?, ?, ?, ?, ?, 0, NULL, ?)
-            """, (payload.machine_id, payload.machine_name, now.isoformat(), trial_expires.isoformat(), now.isoformat(), payload.hardware_fingerprint))
+                VALUES (?, ?, ?, ?, ?, 0, '', ?)
+            """, (payload.machine_id, m_name, now.isoformat(), trial_exp_str, now.isoformat(), hw_fp))
             try: conn.commit()
             except Exception: pass
             conn.close()
@@ -271,9 +284,9 @@ def check_license(request: Request, payload: CheckRequest):
         if existing_expires and (existing_expires - now).total_seconds() > 0 and not row.get("license_key"):
             days_left = max(0, int((existing_expires - now).total_seconds() // 86400))
             conn.execute("""
-                UPDATE licenses SET last_seen = ?, machine_name = ?, hardware_fingerprint = COALESCE(NULLIF(?, ''), hardware_fingerprint)
+                UPDATE licenses SET last_seen = ?, machine_name = ?, hardware_fingerprint = ?
                 WHERE machine_id = ?
-            """, (now.isoformat(), payload.machine_name or row.get("machine_name"), payload.hardware_fingerprint, payload.machine_id))
+            """, (now.isoformat(), m_name, hw_fp, payload.machine_id))
             try: conn.commit()
             except Exception: pass
             conn.close()
@@ -292,7 +305,7 @@ def check_license(request: Request, payload: CheckRequest):
     except Exception as e:
         print("[ERRO FATAL NA ROTA /api/check]:")
         traceback.print_exc()
-        return JSONResponse(status_code=500, content={"status": "error", "error": str(e)})
+        return JSONResponse(status_code=500, content={"status": "error", "error": str(e), "trace": traceback.format_exc()})
 
 # ============================================================================
 # ESTILOS E INTERFACE DO PAINEL WEB
